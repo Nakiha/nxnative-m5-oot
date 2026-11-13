@@ -1,6 +1,7 @@
 // nn::vi (display layer): on a real device, the vi service is used to open the display, create a layer and get the native window handle; the handle is passed to NVN's window builder.
 // Host: returns host static objects; when hooking up Metal, the native window corresponds to the front end's CAMetalLayer (front_metal_layer()).
 #include "../host/hle.h"
+#include "../host/front.h"
 #include <stdatomic.h>
 
 static struct { uint32_t magic; } g_display = {0x50534944}, g_layer = {0x5259414c};
@@ -119,11 +120,16 @@ HLE_FORCE("_ZN2nn2vi8FinalizeEv", "display service shutdown; the host has no vi 
 
 // ---------- Switch 2 SDKs: HDR, VRR and extended swap intervals ----------
 // The SDK's versions check the display against its own default display object and forward the layer to vi2, whose layer object the host never made (Donkey Kong Bananza: a call
-// through null from SetLayerNextHdrContentGamutMetadata, main+0x2036f4). The host's output is SDR at a fixed refresh rate: no HDR output, no VRR, and the layer metadata has
-// nothing to apply to. HdrOutputFormat 0 is SDR; paper white is the BT.2408 reference, 203 nits, read only when HDR is on
-HLE_FORCE("_ZN2nn2vi21QueryDisplayHdrStatusEPbPNS0_15HdrOutputFormatEPtPKNS0_7DisplayE", "display HDR status: SDR output (the host presents SDR)", Result, h_vi_HdrStatus,
+// through null from SetLayerNextHdrContentGamutMetadata, main+0x2036f4). Default output stays SDR. The explicit Mac PQ experiment advertises HDR only after its EDR layer exists.
+// The current Ocarina build ignores the output-format result, reading only the on flag and peak. Format 1 is provisional in this experiment: its SDK enum semantics have not been
+// validated on hardware, so this is not general Switch 2 HDR support. No game-code patches or fixed addresses are used. See docs/reference/services.md#experimental-mac-hdr-output.
+__attribute__((weak)) int front_hdr_peak_nits(void) { return 0; }   // no HDR front end on iOS or in headless tests
+HLE_FORCE("_ZN2nn2vi21QueryDisplayHdrStatusEPbPNS0_15HdrOutputFormatEPtPKNS0_7DisplayE", "display HDR status: SDR by default; explicit Mac PQ experiment when an EDR layer exists", Result, h_vi_HdrStatus,
           uint8_t *on, uint32_t *fmt, uint16_t *peak, const void *disp) {
-    (void)disp; if (on) *on = 0; if (fmt) *fmt = 0; if (peak) *peak = 0; return RES_OK; }
+    (void)disp; int n = front_hdr_peak_nits();
+    if (on) *on = n > 0; if (fmt) *fmt = n > 0 ? 1 : 0; if (peak) *peak = n > 0 ? (uint16_t)n : 0;
+    static atomic_int last = -1; if (atomic_exchange(&last, n) != n) LOG("vi::QueryDisplayHdrStatus: %s, peak %d nits%s", n ? "experimental HDR" : "SDR", n, n ? " (format 1 is provisional; explicit PQ/BT.2020 input)" : "");
+    return RES_OK; }
 HLE_FORCE("_ZN2nn2vi25QueryDisplayHdrPaperWhiteEPtPKNS0_7DisplayE", "display HDR paper white: 203 nits (BT.2408); HDR is off", Result, h_vi_PaperWhite, uint16_t *nits, const void *disp) {
     (void)disp; if (nits) *nits = 203; return RES_OK; }
 HLE_FORCE("_ZN2nn2vi24QueryDisplayVrrSupportedEPbPKNS0_7DisplayE", "display VRR: not supported (fixed refresh rate)", Result, h_vi_VrrSupported, uint8_t *on, const void *disp) {
@@ -152,7 +158,9 @@ HLE_FORCE("_ZN2nn2vi28SetLayerExtendedSwapIntervalEPNS0_5LayerEii", "layer exten
     (void)layer; static atomic_int once; if (!atomic_exchange(&once, 1)) LOG("vi::SetLayerExtendedSwapInterval %d %d: no VRR on the host, the NVN swap interval stays", a, b); return RES_OK; }
 HLE_FORCE("_ZN2nn2vi30ClearLayerExtendedSwapIntervalEPNS0_5LayerE", "layer extended swap interval cleared", Result, h_vi_ExtSwapClear, void *layer) { (void)layer; return RES_OK; }
 HLE_FORCE("_ZN2nn2vi35SetLayerNextHdrContentGamutMetadataEPNS0_5LayerENS0_15HdrContentGamutE", "layer HDR metadata: SDR output, nothing to apply", Result, h_vi_HdrGamut, void *layer, int g) {
-    (void)layer; (void)g; return RES_OK; }
+    (void)layer;
+    if (front_hdr_peak_nits()) { static atomic_int last = -1; if (atomic_exchange(&last, g) != g) LOG("HDR experiment: game gamut metadata %d (recorded only; DM_HDR_INPUT explicitly assumes BT.2020, enum mapping not verified)", g); }
+    return RES_OK; }
 HLE_FORCE("_ZN2nn2vi39SetLayerNextHdrToSdrToneMappingMetadataEPNS0_5LayerENS0_14HdrToneMappingE", "layer HDR metadata: SDR output, nothing to apply", Result, h_vi_HdrToneMap, void *layer, int m) {
     (void)layer; (void)m; return RES_OK; }
 HLE_FORCE("_ZN2nn2vi52SetLayerNextHdrExtendedContentLuminanceRangeMetadataEPNS0_5LayerEtt", "layer HDR metadata: SDR output, nothing to apply", Result, h_vi_HdrExtLum,

@@ -210,6 +210,120 @@ def hmma_msl(msl):
         msl = msl[:a] + text + msl[b:]
     return msl
 
+# Optional MPP HMMA. SIMD A/B/C caches retain the original semantics. The MPP
+# memory-operand calculation is outlined once: inlining it at every HMMA made
+# the device compiler spend over ten minutes in ScalarEvolution::forgetLoop.
+# Ordered-FMA correction preserves both f16 rounding boundaries (see reference).
+HMMA_TENSOR_TYPES = '''#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+constexpr constant auto dm_desc = mpp::tensor_ops::matmul2d_descriptor(16, 8, 16, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+'''
+HMMA_TENSOR_STORE = '''    simdgroup_store(am[0], h, 16, ulong2(0, 0)); simdgroup_store(am[1], h, 16, ulong2(8, 0));
+    simdgroup_store(am[2], h, 16, ulong2(0, 8)); simdgroup_store(am[3], h, 16, ulong2(8, 8));
+    simdgroup_store(b0, h + 256, 16, ulong2(0, 0), true); simdgroup_store(b1, h + 256, 16, ulong2(8, 0), true);
+    simdgroup_store(c0, h + 384, 8, ulong2(0, 0)); simdgroup_store(c1, h + 384, 8, ulong2(0, 8));
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    float ma = 0, mb = 0; bool exceptional = false;
+    #pragma unroll
+    for (uint i = 0; i < 8; ++i) { float x = float(h[uint(%(lane)s) + i * 32]); ma = max(ma, abs(x)); exceptional |= !isfinite(x); }
+    #pragma unroll
+    for (uint i = 0; i < 4; ++i) { float x = float(h[256 + uint(%(lane)s) + i * 32]); mb = max(mb, abs(x)); exceptional |= !isfinite(x); }
+    ma = simd_max(ma); mb = simd_max(mb); exceptional = simd_any(exceptional);
+    auto ta = tensor(h, extents<int, 16, 16>());
+    auto tb = tensor(h + 256, extents<int, 16, 8>());
+    threadgroup float *cf = (threadgroup float *)(s + 256);
+    auto tc = tensor(cf, extents<int, 8, 16>());
+    mpp::tensor_ops::matmul2d<dm_desc, execution_simdgroup> op;
+    auto zero = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
+'''
+HMMA_TENSOR_PHASE = '''    {
+        simdgroup_store(bBLOCK, h + 256, 16, ulong2(BOFF, 0), true);
+        simdgroup_store(zero, h + 256, 16, ulong2(ZOFF, 0), true);
+        #pragma unroll
+        for (uint i = 0; i < 4; ++i) { uint idx = uint(%(lane)s) + i * 32; cf[idx] = float(h[384 + idx]); }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        op.run(ta, tb, tc);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma unroll
+        for (uint i = 0; i < 4; ++i) {
+            uint idx = uint(%(lane)s) + i * 32, row = idx / 8, col = idx & 7;
+            float v = cf[idx], old = float(h[384 + idx]); half r = half(v);
+            ushort bits = as_type<ushort>(r), mag = bits & 0x7fffu;
+            half near0 = as_type<half>(ushort((bits & 0x8000u) | (mag ? mag - 1u : 1u)));
+            half away0 = as_type<half>(ushort((bits & 0x8000u) | (mag + 1u)));
+            float mid0 = (float(r) + float(near0)) * 0.5f, mid1 = (float(r) + float(away0)) * 0.5f;
+            float error = (abs(old) + 8.0f * ma * mb) * 0.00000762939453125f;
+            if (exceptional || !isfinite(old) || !isfinite(float(r)) || v - error <= min(mid0, mid1) || v + error >= max(mid0, mid1)) {
+                v = old;
+                #pragma unroll
+                for (ushort j = 0; j < 8; ++j) { ushort k = BOFF + j; v = fma(float(h[row * 16 + k]), float(h[256 + col * 16 + k]), v); }
+            }
+            h[384 + idx] = half(v);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+'''
+HMMA_TENSOR_LOAD = '''    simdgroup_load(c0, h + 384, 8, ulong2(0, 0)); simdgroup_load(c1, h + 384, 8, ulong2(0, 8));
+'''
+HMMA_TENSOR_MATH_HEAD = '''static __attribute__((noinline)) void dm_tensor_math(threadgroup uint *s, uint lane)
+{
+    threadgroup half *h = (threadgroup half *)s;
+    simdgroup_half8x8 b0, b1;
+    simdgroup_load(b0, h + 256, 16, ulong2(0, 0), true); simdgroup_load(b1, h + 256, 16, ulong2(8, 0), true);
+'''
+
+def hmma_tensor_msl(src):
+    """MPP over memory operands, with the original SIMD caches and half boundaries.
+
+    Outlining the collective math avoids quadratic loop analysis after hundreds
+    of inlined cooperative-tensor constructions. Only its shared scratch grows.
+    """
+    m = re.search(r'\n\w+ dmsh_hmma16816_f16\((.*?)\)\n\{', src, re.S)
+    if not m: return None
+    params = split_params(m[1])
+    scr = next(p for p in params if p.startswith('threadgroup '))
+    shape = re.search(r'spvUnsafeArray<uint, (\d+)>', scr)
+    lane_match, scr_match = re.search(r'(\w+)$', params[0]), re.search(r'(\w+)$', scr)
+    if not shape or not lane_match or not scr_match: return None
+    n, lane, scrname = int(shape[1]), lane_match[1], scr_match[1]
+    if n % 256: return None
+    # A 256-word SIMD-group slice grows to 384 words for a 128-float result.
+    old_type, new_type = f'spvUnsafeArray<uint, {n}>', f'spvUnsafeArray<uint, {n * 3 // 2}>'
+    src = src.replace(scr, scr.replace(old_type, new_type))
+    opens = [m.start() + 1 for m in re.finditer(r'\n\{', src)]
+    edits, ends, seen = [], {}, set()
+    helper_open = src.index('\n{', src.index(' dmsh_hmma16816_f16('))
+    for c in HMMA_CALL.finditer(src):
+        if c.start() < helper_open: continue
+        args = split_params(c[1]); name = args[len(HMMA_ARGS)]
+        op = opens[bisect.bisect_right(opens, c.start()) - 1]
+        if (op, name) in seen: continue
+        seen.add((op, name))
+        if op not in ends: ends[op] = block_end(src, op)
+        decl = re.search(r'threadgroup spvUnsafeArray<uint, ' + str(n) + r'> ' + re.escape(name) + r';', src[op:ends[op]])
+        if not decl: return None
+        edits.append((op + decl.start(), op + decl.end(), decl[0].replace(old_type, new_type)))
+    for a, b, text in sorted(edits, reverse=True): src = src[:a] + text + src[b:]
+    blk = re.search(r'&' + re.escape(scrname) + r'\[uint\((\w+)\)\]', src)
+    if not blk: return None
+    src = src.replace(blk[0], f'&{scrname}[uint({blk[1]}) * 3 / 2]')
+    a = src.index('    simdgroup_multiply_accumulate(f0, am[0]'); b = src.index('    if (dslot)', a)
+    split = HMMA_TENSOR_STORE.index('    float ma')
+    math = HMMA_TENSOR_MATH_HEAD + HMMA_TENSOR_STORE[split:] + ''.join(
+        HMMA_TENSOR_PHASE.replace('BLOCK', str(i)).replace('BOFF', str(8 * i)).replace('ZOFF', str(8 * (1 - i))) for i in range(2)) + '}\n'
+    math = math % dict(lane='lane')
+    call = HMMA_TENSOR_STORE[:split] % dict(lane=lane) + f'    dm_tensor_math(s, uint({lane}));\n' + HMMA_TENSOR_LOAD
+    src = src[:a] + call + src[b:]
+    src = src.replace('using namespace metal;', 'using namespace metal;\n' + HMMA_TENSOR_TYPES + math, 1)
+    # Keep the original when the extra 512 bytes per SIMD-group would exceed
+    # Metal's declared threadgroup memory limit.
+    total = 0
+    for d in TG_DECL.finditer(src):
+        elem = d.group(3) or d.group(2)
+        if elem not in TG_BYTES: return None
+        total += (TG_BYTES[elem] * int(d.group(4) or d.group(6) or 1) + 15) & ~15
+    return src if total <= abi.TG_MAX else None
+
 # A store only the very first invocation of a dispatch makes (a compute shader's preamble: `if (-local.x == workgroup.x << log2(local size)) buffer[k] = value`). Hoian_Proc in Splatoon Raiders resets its append counter
 # that way, with the other invocations adding to the counter at their end, hundreds of instructions later. On the Switch the first workgroup starts ahead of them. Apple's GPUs start workgroups in no order: a workgroup that had appended before
 # the reset lost its plants to the next one's, a different few each frame, and they flickered. So the store leaves the shader and the host makes it, in order, before the dispatch (the reflection's first_store, nvn_mtl.m). Only this exact

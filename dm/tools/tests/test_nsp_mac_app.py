@@ -256,6 +256,16 @@ class PackReuse(unittest.TestCase):
         self.codesign = self.tmp / 'bin/other-codesign'; self.assert_repacked()
         self.codesign.write_text('changed signing tool'); self.assert_repacked()
 
+    def test_experiment_data_id_validation(self):
+        a = types.SimpleNamespace(**vars(self.args)); a.data_id = TID + '-HDR'
+        info = pack_app.info_plist(a, '26.6', False)
+        self.assertEqual(info['DMDataID'], a.data_id)
+        self.assertEqual(info['DMTitleID'], TID)
+        for value in ('../save', '/save', 'a/b', 'a.b', 'a' * 64):
+            a.data_id = value
+            with self.subTest(value=value), self.assertRaisesRegex(SystemExit, '--data-id'):
+                pack_app.info_plist(a, '26.6', False)
+
     def test_launcher_is_linked_from_its_c_and_swift_sources(self):
         self.pack()
         c = next(c for c in self.commands if Path(c[0]).name == 'clang' and '-o' in c)
@@ -500,6 +510,17 @@ class App(unittest.TestCase):
             self.assertEqual((self.tmp / 'Split.app/Contents/Resources/dm/pso_pairs.tsv').read_text(), 'split-vertex\tsplit-pixel\n')
             a.out = str(self.tmp / 'Own.app'); a.tables = self.args.tables; pack_app.pack(a)
             self.assertEqual((self.tmp / 'Own.app/Contents/Resources/dm/pso_pairs.tsv').read_text(), 'other-vertex\tother-pixel\n')
+
+    def test_experiment_data_isolation(self):
+        a = types.SimpleNamespace(**vars(self.args)); a.out = str(self.tmp / 'Isolated.app'); a.icon = None; a.data_id = TID + '-HDR'
+        with contextlib.redirect_stdout(io.StringIO()): pack_app.pack(a)
+        p = self.launch(app=Path(a.out)); p.communicate(timeout=20)
+        self.assertEqual(p.returncode, 7)
+        env = self.host_run()
+        root = self.tmp / 'home/Library/Application Support/nxnative' / a.data_id
+        self.assertEqual(env['DM_SAVE'], str(root / 'save'))
+        self.assertEqual(env['DM_ROOT'], str(root))
+        self.assertTrue((self.tmp / 'home/Library/Logs/nxnative' / (a.data_id + '.log')).is_file())
 
     def test_info_plist(self):
         p = plistlib.loads((self.app / 'Contents/Info.plist').read_bytes())

@@ -260,7 +260,8 @@ static void tile_case(const char *dir) {
     tex_t source; id<MTLTexture> attachment = target(&source, 99795);
     mtl_reg_tex(tid, &source, NULL);
     id<MTLBuffer> zero = [g_dev newBufferWithLength:256 options:MTLResourceStorageModeShared]; res_add(zero);   // the variant's argument buffer: the tile read leaves its texture and sampler unread
-    id<MTLBuffer> result = [g_dev newBufferWithLength:1024 options:MTLResourceStorageModeShared]; res_add(result);
+    id<MTLBuffer> result = [g_dev newBufferWithLength:1024 options:MTLResourceStorageModeShared];
+    res_add(result);
     state_reset(); memset(&R, 0, sizeof R); mtl_sub_begin();
     R.has_rt = 1; R.rt.n = 1; R.rt.color[0] = &source; S.tex[1][0] = tid; S.chmask.mask = 0xffffffffu;
     S.has_vp = 1; S.vp[0][0] = 0; S.vp[0][1] = 0; S.vp[0][2] = 4; S.vp[0][3] = 4;
@@ -479,10 +480,17 @@ static void cut_boundary_case(void) {
     mtl_sub_counter((uint64_t)rep.contents, 0x10);
     atomic_fetch_add(&g_seg_inflight, 1);
     g_stat_draw += (uint64_t)cut_draws(); sub_cut();
-    CHECK(g_cb == cb0 && g_seg == 1, "with work running: a boundary, no commit");
+    int early = cut_first_eligible(cut_draws(), 0, cut_first());
+    CHECK((early ? g_cb != cb0 : g_cb == cb0) && g_seg == 1, "with work running: only an opted-in first segment commits");
+    cb0 = g_cb;
     CHECK(g_sclk && g_sclk->nb == 2, "and its timestamp slot");
     clear(MTLClearColorMake(0, 1, 0, 1)); rp_end();
     mtl_sub_counter((uint64_t)rep.contents + 16, 0x10);
+    if (early) {   // the opted-in first cut really submitted work, unlike the old boundary-only case
+        rec_drain(); uint64_t deadline = bp_now() + 5000000000ull;
+        while (atomic_load(&g_seg_inflight) > 1 && bp_now() < deadline) usleep(1000);
+        CHECK(atomic_load(&g_seg_inflight) == 1, "the early segment completed before testing an idle later cut");
+    }
     atomic_fetch_sub(&g_seg_inflight, 1);
     g_stat_draw += (uint64_t)cut_draws(); sub_cut();
     CHECK(g_cb != cb0 && g_seg == 2, "with nothing running: a commit");
@@ -635,7 +643,10 @@ static void real_depth_snap_case(NvProg *pr, int colour_pass, int stencil, int p
     if (!dt) { if (colour_pass) mtl_tex_release(&colour); return; }
     res_add(dt); mtl_tex_init(&depth); serial_put(depth.serial, dt);   // NOLINT(clang-analyzer-osx.cocoa.RetainCount): g_by_serial owns the texture until mtl_tex_release below, not a leak
     mtl_reg_tex(655, &depth, NULL);
-    id<MTLBuffer> result = [g_dev newBufferWithLength:1024 options:MTLResourceStorageModeShared]; res_add(result);
+    id<MTLBuffer> result = [g_dev newBufferWithLength:1024 options:MTLResourceStorageModeShared];
+    CHECK(result != nil, "real depth readback buffer allocates");
+    if (!result) { if (colour_pass) mtl_tex_release(&colour); mtl_tex_release(&depth); return; }
+    res_add(result);
     state_reset(); memset(&R, 0, sizeof R); mtl_sub_begin();
     R.has_rt = 1; R.rt.n = colour_pass; if (colour_pass) R.rt.color[0] = &colour; R.rt.depth = &depth;
     S.ds.dt = S.ds.dw = 1; S.tex[1][0] = 655;

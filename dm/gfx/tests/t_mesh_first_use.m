@@ -19,31 +19,35 @@ static int checks, failures;
 static void require(int ok, const char *name) { CHECK(ok, name); if (!ok) exit(2); }
 
 static NvShader *shader(id<MTLLibrary> library, NSString *name, int stage) {
-    NvShader *s = [NvShader new]; s->fn = [library newFunctionWithName:name]; s->stage = stage;
+    NvShader *s = [NvShader new]; s->fn = fn4_note([library newFunctionWithName:name], library, name, nil); s->stage = stage;
     snprintf(s->key, sizeof s->key, "first_use_%s", name.UTF8String);
     require(s->fn != nil, "test shader function exists"); return s;
 }
 int main(void) { @autoreleasepool {
     mtl_init(); NSError *error = nil;
     id<MTLLibrary> library = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
-        "struct V { float4 position [[position]]; }; struct Payload { uint first; }; struct Block { uint first; };\n"
+        "struct V { float4 position [[position]]; }; struct Payload { uint first; }; struct Block { uint first, scratch; };\n"
         "using Mesh = metal::mesh<V, void, 3, 1, metal::topology::triangle>;\n"
         "void triangle(Mesh m, uint first) { float z = float(first) * 0.125f;\n"
         "  m.set_vertex(0, V{float4(-1,-1,z,1)}); m.set_vertex(1, V{float4(3,-1,z,1)}); m.set_vertex(2, V{float4(-1,3,z,1)});\n"
         "  m.set_index(0,0); m.set_index(1,1); m.set_index(2,2); m.set_primitive_count(1); }\n"
         // As dmsh_meshstage.py emits them: the task and object functions read the draw's {count, first} at buffer 29, and a mesh shader with no task its block's first workgroup
         "[[object]] void block(object_data Block& b [[payload]], mesh_grid_properties grid, uint otg [[threadgroup_position_in_grid]], constant uint* draw [[buffer(29)]]) {\n"
-        "  uint base = otg * 1024u; b.first = draw[1] + base; grid.set_threadgroups_per_grid(uint3(min(draw[0] - base, 1024u), 1u, 1u)); }\n"
+        "  uint base = otg * 1024u; b.first = draw[1] + base; b.scratch = base; grid.set_threadgroups_per_grid(uint3(min(draw[0] - base, 1024u), 1u, 1u)); }\n"
         "[[mesh]] void direct(Mesh m, const object_data Block& b [[payload]], uint tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) { if (!tid) triangle(m, b.first + tg); }\n"
         "[[object]] void task(object_data Payload& p [[payload]], mesh_grid_properties grid, uint tid [[thread_index_in_threadgroup]], constant uint* draw [[buffer(29)]]) {\n"
         "  if (!tid) { p.first = draw[1]; grid.set_threadgroups_per_grid(uint3(1)); } }\n"
         // a workgroup's own pixel of a GW x GH target (its number modulo the pixels), at depth (number + 1) / 8192: a triangle around that pixel's centre and no other
         "constant uint GW = 64, GH = 48;\n"
-        "[[mesh]] void pixel(Mesh m, const object_data Block& b [[payload]], uint tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {\n"
-        "  if (tid) return; uint wg = b.first + tg, p = wg % (GW * GH); float dx = 2.0f / GW, dy = 2.0f / GH, z = float(wg + 1) / 8192.0f;\n"
+        "void pixel_body(Mesh m, uint wg, float extra) {\n"
+        "  uint p = wg % (GW * GH); float dx = 2.0f / GW, dy = 2.0f / GH, z = float(wg + 1) / 8192.0f + extra;\n"
         "  float2 c = float2((float(p % GW) + 0.5f) * dx - 1.0f, (float(p / GW) + 0.5f) * dy - 1.0f);\n"   // NVN's origin is the lower left: row 0 at y = -1
         "  m.set_vertex(0, V{float4(c.x - 0.25f * dx, c.y + 0.25f * dy, z, 1)}); m.set_vertex(1, V{float4(c.x + 0.75f * dx, c.y + 0.25f * dy, z, 1)});\n"
         "  m.set_vertex(2, V{float4(c.x - 0.25f * dx, c.y - 0.75f * dy, z, 1)}); m.set_index(0,0); m.set_index(1,1); m.set_index(2,2); m.set_primitive_count(1); }\n"
+        "[[mesh]] void pixel(Mesh m, const object_data Block& b [[payload]], uint tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) { if (!tid) pixel_body(m,b.first+tg,0); }\n"
+        "[[mesh]] void pixel_s(Mesh m, const object_data Block& b [[payload]], uint tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], device uint* scratch [[buffer(30)]]) {\n"
+        "  uint at=(b.scratch+tg)*256u; scratch[at+tid]=b.first+tg+tid; threadgroup_barrier(mem_flags::mem_device);\n"
+        "  if (!tid) pixel_body(m,scratch[at+31u]-31u,.5f); }\n"
         "[[mesh]] void tasked(Mesh m, const object_data Payload& p [[payload]], uint tid [[thread_index_in_threadgroup]]) { if (!tid) triangle(m, p.first); }\n"
         "vertex float4 vertex_only(uint vid [[vertex_id]]) { const float2 p[] = {float2(-1,-1),float2(3,-1),float2(-1,3)}; return float4(p[vid % 3], float(vid / 3 + 1) * 0.125f, 1); }\n"
         "fragment float4 color() { return float4(0,1,0,1); }\n"
@@ -53,7 +57,8 @@ int main(void) { @autoreleasepool {
     NvShader *ms = shader(library, @"direct", 4), *tasked = shader(library, @"tasked", 4), *ts = shader(library, @"task", 3), *fs = shader(library, @"color", 1);
     NvShader *vs = shader(library, @"vertex_only", 0), *px = shader(library, @"pixel", 4);
     ms->mesh_kind = tasked->mesh_kind = px->mesh_kind = 2; ms->mesh_notask = px->mesh_notask = 1; px->mesh_threads = 32;
-    ms->mesh_obj = px->mesh_obj = [library newFunctionWithName:@"block"]; require(ms->mesh_obj != nil, "the block object function exists");
+    ms->mesh_obj = px->mesh_obj = fn4_note([library newFunctionWithName:@"block"], library, @"block", nil); require(ms->mesh_obj != nil, "the block object function exists");
+    px->mesh_sfn = fn4_note([library newFunctionWithName:@"pixel_s"], library, @"pixel_s", nil); px->mesh_sobj = px->mesh_obj; px->mesh_scratch = 1024;
     ms->mesh_threads = tasked->mesh_threads = ts->mesh_threads = 32; ts->mesh_kind = 1; ts->mesh_payload = 4; fs->rf.color_mask = 1;
     prog_t programs[4] = {0};
     for (int kind = 0; kind < 4; kind++) {
@@ -131,7 +136,8 @@ int main(void) { @autoreleasepool {
             P(nvnCommandBufferSetDepthRange)(&command, 0, 1); P(nvnCommandBufferBindDepthStencilState)(&command, &ds);
             P(nvnCommandBufferClearDepthStencil)(&command, 1, 1, 0, 0); P(nvnCommandBufferClearColor)(&command, 0, blue, 15);
             P(nvnCommandBufferBindProgram)(&command, (const NVNprogram *)&big, 0xc3);
-            if (ind) drawi(&command, P(nvnMemoryPoolGetBufferAddress)(&rp)); else draw(&command, FIRST, N);
+            // More draws than the region ring: reuse needs its mesh barrier, and each draw after an alternate pipeline must restore the native one for overflow.
+            for (int repeat=0;repeat<9;repeat++) { if (ind) drawi(&command, P(nvnMemoryPoolGetBufferAddress)(&rp)); else draw(&command, FIRST, N); }
             NVNcommandHandle handle = P(nvnCommandBufferEndRecording)(&command);
             P(nvnQueueSubmitCommands)(&queue, 1, &handle); P(nvnQueueFinish)(&queue);
             id<MTLBuffer> pixels = [g_dev newBufferWithLength:N * 4 options:MTLResourceStorageModeShared]; res_add(pixels);
@@ -139,7 +145,8 @@ int main(void) { @autoreleasepool {
             enc_b_copy_texture_buffer(blit(), tex_mtl(&bd), 0, 0, MTLOriginMake(0,0,0), MTLSizeMake(GW,GH,1), pixels, 0, GW * 4, N * 4);
             require(mtl_wait(mtl_sub_commit(), 5000000000ull), "readback finishes"); CHECK(!mtl_last_commit_error(), "Metal reports no execution error");
             const float *z = pixels.contents; int good = 1, missing = 0;
-            for (int p = 0; p < N; p++) { uint32_t wg = p < FIRST ? p + N : p; int ok = z[p] == (float)(wg + 1) / 8192.0f; good &= ok; missing += z[p] == 1.0f; }
+            float extra = mesh_scratch_cap() >= N ? .5f : 0;
+            for (int p = 0; p < N; p++) { uint32_t wg = p < FIRST ? p + N : p; int ok = z[p] == (float)(wg + 1) / 8192.0f + extra; good &= ok; missing += z[p] == 1.0f; }
             if (!good) { fprintf(stderr, "%d of %d pixels not drawn\n", missing, N);
                 for (int p = 0, shown = 0; p < N && shown < 6; p++) { uint32_t wg = p < FIRST ? p + N : p; if (z[p] != (float)(wg + 1) / 8192.0f) { shown++; fprintf(stderr, "  pixel %d (%d,%d): %.7f = number %.1f, expected %u\n", p, p % GW, p / GW, z[p], z[p] * 8192.0f - 1, wg); } } }
             CHECK(good, ind ? "an indirect draw past the mesh grid's limit draws every workgroup at its number" : "a direct draw past the mesh grid's limit draws every workgroup at its number");

@@ -1,5 +1,7 @@
 # nxnative
 
+This is [Nakiha's M5-focused fork](https://github.com/Nakiha/nxnative-m5-oot) of [seedds/nxnative](https://github.com/seedds/nxnative), maintained on `m5-oot` for The Legend of Zelda: Ocarina of Time. Start with the [M5 build and maintenance guide](docs/m5-oot.md). It preserves HDR, the original upscaler network and native image settings; the current experiments do **not** establish stutter-free 60 fps. Upstream's project, credits and license remain below.
+
 Play your own Nintendo Switch and Switch 2 games natively on Apple silicon Macs, iPhone and iPad. One script packs your game into a Mac app or an unsigned IPA that you sideload.
 
 It is not an emulator: the game's own code runs directly on the Apple chip, with Switch graphics rebuilt on Metal. Nothing from any game is in this repository, and the project is not affiliated with Nintendo or any game publisher.
@@ -58,7 +60,7 @@ The shaders are built with Xcode 27.2's Metal compiler. Select it before step 1:
 
 ```
 xcodebuild -downloadComponent MetalToolchain
-git clone https://github.com/seedds/nxnative.git && cd nxnative
+git clone --branch m5-oot https://github.com/Nakiha/nxnative-m5-oot.git && cd nxnative-m5-oot
 brew install xcodegen zstd glslang
 python3 -m pip install lz4 "capstone>=5,<6" fonttools nsz zbic "backports.zstd; python_version < '3.14'"
 ```

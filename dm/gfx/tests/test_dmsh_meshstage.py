@@ -21,6 +21,7 @@ struct spvUnsafeArray
     T elements[Num ? Num : 1];
     thread T& operator [] (size_t pos) thread { return elements[pos]; }
     threadgroup T& operator [] (size_t pos) threadgroup { return elements[pos]; }
+    device T& operator [] (size_t pos) device { return elements[pos]; }
 };
 struct B { uint _m0[4]; };
 struct spvDescriptorSetBuffer0 { constant B* cp_c3 [[id(0)]]; };
@@ -215,9 +216,32 @@ class Stage(unittest.TestCase):
     def test_position_is_invariant(self):   # two mesh shaders of one geometry must agree: a pre-pass and a colour pass testing depth for equality
         self.assertIn('float4 position [[position, invariant]];', self.mesh()[0])
 
+    def big(self, task=False, threads=32):
+        i = ms.info(control(7, threads=threads, payload=128, task=int(task), max_v=256, max_p=512, prim_at=0x80), sph(0xf0, b'\x30') + sph(0, b'\x01'))
+        words, at = ms.memory(i)[1] // 4, ms.memory(i)[0][3] // 4
+        return ms.to_stage(KERNEL % (words, at), i), i
+
+    def test_draw_private_device_entry_preserves_the_original(self):
+        src, i = self.big()
+        native, device = src.split('namespace dm_mesh_scratch {', 1)
+        self.assertIn('threadgroup spvUnsafeArray', native)
+        self.assertNotIn('threadgroup spvUnsafeArray', device)
+        self.assertIn('device spvUnsafeArray<uint,', device)
+        self.assertIn('ulong(dm_block.scratch + dm_tg)', device)
+        self.assertIn('dm_block.first = dm_draw[1] + b; dm_block.scratch = b;', device)
+        self.assertIn(f'buffer({abi.MESH_SCRATCH_SLOT})', device)
+        for name in ['main0_s', 'main0_zs', 'main0_os']: self.assertIn(f'host_name("{name}")', device)
+        self.assertIn('mem_flags::mem_device | mem_flags::mem_threadgroup', device)
+        self.assertNotIn('atomic_exchange', device)
+        self.assertNotIn('dm_own', device)
+        self.assertEqual(i['scratch'] % 256, 0)
+        for other, facts in [self.big(task=True), self.big(threads=64)]:
+            self.assertNotIn('namespace dm_mesh_scratch', other)
+            self.assertNotIn('scratch', facts)
+
     @unittest.skipUnless(shutil.which('xcrun') and subprocess.run(['xcrun', '-sdk', 'macosx', '-f', 'metal'], capture_output=True).returncode == 0, 'no Metal compiler')
     def test_compiles(self):
-        cases = [self.task()[0], self.mesh()[0], self.mesh(task=True)[0], self.mesh(primitive=True)[0], self.mesh(vertices=32, primitives=32, pos=0xf8, verts=1, reads={5: 0x7})[0], self.mesh(primitive=True, reads={0: 1, 1: 0xf, 5: 0xf})[0], self.local_word()]
+        cases = [self.task()[0], self.mesh()[0], self.mesh(task=True)[0], self.mesh(primitive=True)[0], self.mesh(vertices=32, primitives=32, pos=0xf8, verts=1, reads={5: 0x7})[0], self.mesh(primitive=True, reads={0: 1, 1: 0xf, 5: 0xf})[0], self.local_word(), self.big()[0]]
         with tempfile.TemporaryDirectory() as d:
             for n, src in enumerate(cases):
                 f = Path(d, f's{n}.metal'); f.write_text(src)

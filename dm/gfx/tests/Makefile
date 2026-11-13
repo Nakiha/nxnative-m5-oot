@@ -120,8 +120,48 @@ check_t_perf_order: t_perf_order
 	DM_NVN_FAST_WAKE=0 DM_NVN_SLICE_MERGE=0 DM_NVN_CS_HOIST=0 MTL_DEBUG_LAYER=1 ./t_perf_order
 t_link_ticks: t_link_ticks.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_link_ticks.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+t_rt_present: t_rt_present.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_rt_present.m ../nvn/nvn_mtl.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+.PHONY: check_t_rt_present
+check_t_rt_present: t_rt_present
+	DM_RT_PRESENT=0 ./t_rt_present
+	DM_RT_PRESENT=1 ./t_rt_present
+	DM_RT_PRESENT=1 DM_RT=0 ./t_rt_present
+	DM_RT_PRESENT=1 DM_RT_COMP=4 ./t_rt_present
+t_cut_first: t_cut_first.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_cut_first.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_cut_first
+check_t_cut_first: t_cut_first
+	DM_NVN_ENC_THREAD=0 DM_NVN_CUT_BUSY=0 DM_NVN_CUT=32 DM_NVN_CUT_FIRST=0 MTL_DEBUG_LAYER=1 ./t_cut_first
+	DM_NVN_ENC_THREAD=0 DM_NVN_CUT_BUSY=0 DM_NVN_CUT=32 DM_NVN_CUT_FIRST=1 MTL_DEBUG_LAYER=1 ./t_cut_first
+	DM_NVN_ENC_THREAD=0 DM_NVN_CUT_BUSY=0 DM_NVN_CUT=0 DM_NVN_CUT_FIRST=1 MTL_DEBUG_LAYER=1 ./t_cut_first
+	DM_NVN_ENC_THREAD=0 DM_NVN_CUT_BUSY=0 DM_NVN_CUT=4 DM_NVN_CUT_FIRST=1 MTL_DEBUG_LAYER=1 ./t_cut_first
+	DM_NVN_ENC_THREAD=1 DM_NVN_CUT_BUSY=0 DM_NVN_CUT=32 DM_NVN_CUT_FIRST=1 MTL_DEBUG_LAYER=1 ./t_cut_first
 t_cpu_tex: t_cpu_tex.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_cpu_tex.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+# The game's dispatches side by side in the copy encoder where no barrier of its and nothing else lies between them (dispatch_enc, DM_NVN_DISPATCH_OVERLAP)
+t_dispatch_overlap: t_dispatch_overlap.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_dispatch_overlap.m $(MTL_T_SRC) $(FW)
+t_compute_after_render: t_compute_after_render.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_compute_after_render.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_compute_after_render
+check_t_compute_after_render: t_compute_after_render
+	DM_NVN_ENC_THREAD=0 DM_NVN_BARRIER=game DM_NVN_COMPUTE_GAME_BAR=0 MTL_DEBUG_LAYER=1 ./t_compute_after_render
+	DM_NVN_ENC_THREAD=0 DM_NVN_BARRIER=game DM_NVN_COMPUTE_GAME_BAR=1 MTL_DEBUG_LAYER=1 ./t_compute_after_render
+	DM_NVN_ENC_THREAD=0 DM_NVN_BARRIER=full DM_NVN_COMPUTE_GAME_BAR=1 MTL_DEBUG_LAYER=1 ./t_compute_after_render
+	DM_NVN_ENC_THREAD=1 DM_NVN_BARRIER=game DM_NVN_COMPUTE_GAME_BAR=1 MTL_DEBUG_LAYER=1 ./t_compute_after_render
+.PHONY: check_t_dispatch_overlap
+check_t_dispatch_overlap: t_dispatch_overlap
+	DM_NVN_DISPATCH_OVERLAP=1 MTL_DEBUG_LAYER=1 ./t_dispatch_overlap
+	DM_NVN_DISPATCH_OVERLAP=0 MTL_DEBUG_LAYER=1 ./t_dispatch_overlap
+t_rec_sub_end: t_rec_sub_end.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_rec_sub_end.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_rec_sub_end
+check_t_rec_sub_end: t_rec_sub_end
+	DM_NVN_ENC_THREAD=1 DM_NVN_ENC_ASYNC=0 MTL_DEBUG_LAYER=1 ./t_rec_sub_end
+	DM_NVN_ENC_THREAD=1 DM_NVN_ENC_ASYNC=1 MTL_DEBUG_LAYER=1 ./t_rec_sub_end
+t_command_prepare: t_command_prepare.c ../nvn/nvn_prepare.h ../nvn/nvn_obj.h
+	clang $(CFLAGS) -o $@ t_command_prepare.c
 .PHONY: check_t_cpu_tex
 check_t_cpu_tex: t_cpu_tex
 	MTL_DEBUG_LAYER=1 ./t_cpu_tex --metal
@@ -202,6 +242,11 @@ check_t_present_rescue: t_present_rescue
 	MTL_DEBUG_LAYER=1 ./t_present_rescue --metal
 t_present_alloc: t_present_alloc.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_present_alloc.m $(MTL_T_SRC) $(FW)
+t_present_hdr: t_present_hdr.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_present_hdr.m $(MTL_T_SRC) $(FW)
+check_t_present_hdr: RUN_ENV = MTL_DEBUG_LAYER=1
+t_vi_hdr: t_vi_hdr.c hdr_front_stub.c ../hle_vi.c ../../host/front.h
+	clang $(CFLAGS) -o $@ t_vi_hdr.c hdr_front_stub.c
 .PHONY: check_t_present_alloc
 check_t_present_alloc: t_present_alloc
 	MTL_DEBUG_LAYER=1 ./t_present_alloc
@@ -263,6 +308,7 @@ t_queue_origin: t_queue_origin.m $(MTL_T_DEP)
 check_t_queue_origin: t_queue_origin
 	MTL_DEBUG_LAYER=1 ./t_queue_origin
 	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_queue_origin
+	DM_NVN_ENC_THREAD=1 DM_NVN_BARRIER=game MTL_DEBUG_LAYER=1 ./t_queue_origin
 t_rt_lifetime: t_rt_lifetime.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_rt_lifetime.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
 .PHONY: check_t_rt_lifetime
@@ -471,6 +517,9 @@ check_t_upgrade_alias: RUN_ENV = MTL_DEBUG_LAYER=1
 t_alias_takeover: t_alias_takeover.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_alias_takeover.m $(MTL_T_SRC) $(FW)
 check_t_alias_takeover: RUN_ENV = MTL_DEBUG_LAYER=1
+t_view_cache: t_view_cache.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_view_cache.m $(MTL_T_SRC) $(FW)
+check_t_view_cache: RUN_ENV = MTL_DEBUG_LAYER=1
 t_srgb_alias: t_srgb_alias.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_srgb_alias.m $(MTL_T_SRC) $(FW)
 check_t_srgb_alias: RUN_ENV = MTL_DEBUG_LAYER=1
@@ -488,6 +537,8 @@ check_t_rt_recycle: t_rt_recycle
 	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_rt_recycle
 	DM_NVN_RT_RECYCLE=0 MTL_DEBUG_LAYER=1 ./t_rt_recycle
 # A game's upscaler drawn by MetalFX (any profile; the profile's upscaler shaders, from its shader map, when it has some); with and without the switch, and on the encoding thread
+t_tensor_compiler: t_tensor_compiler.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_tensor_compiler.m $(MTL_T_SRC) $(FW)
 t_upscaler_mfx: t_upscaler_mfx.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_upscaler_mfx.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_upscaler_mfx
@@ -572,6 +623,9 @@ t_mesh_first_use: t_mesh_first_use.m $(MTL_T_DEP)
 check_t_mesh_first_use: t_mesh_first_use
 	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_mesh_first_use
 	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_mesh_first_use
+	DM_NVN_ENC_THREAD=0 DM_NVN_MESH_SCRATCH=4096 MTL_DEBUG_LAYER=1 ./t_mesh_first_use
+	DM_NVN_ENC_THREAD=1 DM_NVN_MESH_SCRATCH=4096 MTL_DEBUG_LAYER=1 ./t_mesh_first_use
+	DM_NVN_ENC_THREAD=1 DM_NVN_MESH_SCRATCH=2048 MTL_DEBUG_LAYER=1 ./t_mesh_first_use
 
 t_wait_event: t_wait_event.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_wait_event.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
@@ -581,11 +635,17 @@ t_queue_lifetime: t_queue_lifetime.m $(MTL_T_DEP)
 
 .PHONY: check_t_wait_event check_t_queue_lifetime
 check_t_wait_event: t_wait_event
-	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 ./$<
-	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 ./$<
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 DM_NVN_QDEFER=0 ./$<
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 DM_NVN_QDEFER=0 ./$<
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 DM_NVN_PREPARE_COMMANDS=1 DM_NVN_QDEFER=0 ./$<
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 DM_NVN_QDEFER=1 ./$<
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 DM_NVN_QDEFER=1 DM_NVN_PREPARE_COMMANDS=1 ./$<
 check_t_queue_lifetime: t_queue_lifetime
-	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 ./$<
-	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 ./$<
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 DM_NVN_QDEFER=0 ./$<
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 DM_NVN_QDEFER=0 ./$<
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 DM_NVN_PREPARE_COMMANDS=1 DM_NVN_QDEFER=0 ./$<
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 DM_NVN_QDEFER=1 ./$<
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 DM_NVN_QDEFER=1 DM_NVN_PREPARE_COMMANDS=1 ./$<
 
 t_render_enable_queue: t_render_enable_queue.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_render_enable_queue.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)

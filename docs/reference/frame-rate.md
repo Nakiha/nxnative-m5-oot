@@ -386,6 +386,14 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Check:** the reporter confirmed that the deferred request entered fullscreen on its first attempt and stayed there, without a refusal. A harness of the startup callbacks checks both readiness orders, bounded refusal recovery, and cancellation before startup or a queued retry, plus later manual failures after successful startup.
 - **Not checked:** the revised lifecycle handling in a real game through the launcher's console mode; native refusal recovery (the reporter's deferred request succeeded without it).
 
+
+### Display-link drawables reject timed presentation
+
+- **Symptom:** an experimental display-link present using `presentAfterMinimumDuration:` aborts with `CAMetalDrawableInvalidOperation`: `-presentAfterMinimumDuration should not be called when using CAMetalDisplayLink.`
+- **Cause:** the drawable supplied by `CAMetalDisplayLinkUpdate` cannot be presented with that timed-drawable API. Applying the ordinary `nextDrawable` path's minimum-duration rule to it is invalid, even though the selector exists on `MTLDrawable`.
+- **Fix:** keep `present_now`'s display-link branch on `present`; pace through the display link. Only the ordinary drawable path uses `presentAfterMinimumDuration:`. The host comment now states this restriction; a proposed unconditional minimum-duration change was reverted after the first windowed present failed. A correct fix for the reported fullscreen instability remains open.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#heavier-village-view-and-presentation-follow-up-m5-2026-11-11-open), local HDR performance experiment on an M5 with macOS 27.3. No game scene or performance result was obtained with the rejected change, and it was never packed into the player's app.
+
 ### Frame latency 2 for the display link in fullscreen
 
 - **Symptom:** on a ProMotion built-in screen, only in fullscreen, the frame step went 1 → 2 → 3 vsyncs on frames costing 0.1–0.6 vsyncs (`3 late frames; cost 0.32 vsyncs`) and the game presented 15 frames a second; a window, or the screen set to a fixed 60 Hz, did not do it. The `DM_NVN_TSV` rows show presents shown one 120 Hz refresh late (`@pres_at_ms` − `@link_target_ms` = 8.3 ms) with a skipped tick after each (`@link_gap_ms` 33 ms), and `@link_lead_ms` about 16 ms against about 50 ms in a window.
@@ -568,6 +576,14 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Open:** the main pass at about 763x429 is a low resolution, and the GPU at about 17 ms is still a little over budget, so the frame rate is not locked.
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md).
 
+### Draw passes that wait for each other again while images share memory
+
+- **Symptom:** a game with `draw_barriers game` gets no benefit from it: the 300-frame log line `draw-pass entry barriers full N / saved 0`, every draw pass behind a full barrier, and in a Metal System Trace many small idle gaps between consecutive render encoders of one command buffer (Ocarina of Time on an M1 Max: 141 a frame, 2.3 ms in all).
+- **Cause:** two things in `enc_r_begin_pass` / `enc_r_end_pass` (`nvn_mtl.m`). The relaxed barriers were turned off whenever image family heaps exist (`g_image_heap_n`), so that the alias flush stays off end barriers, where it costs a command allocator about 100 KB per encoder; Ocarina of Time's dynamic resolution always has such heaps. And any nonzero `nvnCommandBufferBarrier` forced the full barrier, while in NVN only `ORDER_PRIMITIVES` and `ORDER_INDIRECT_DATA` order earlier work before later vertex or indirect fetch: the game's most common barrier, `0x12` (`ORDER_FRAGMENTS | INVALIDATE_TEXTURE`), asks only for fragment-to-fragment order, which the relaxed end barrier (vertex, mesh and fragment before fragment, dispatch and blit) gives.
+- **Fix:** for every game with `draw_barriers game`: the guard is gone; the relaxed end barrier flushes to the device only, and when aliases exist the alias flush is a start barrier of the next pass before its fragments (`barrierAfterQueueStages:All beforeStages:Fragment`), where it costs no allocator memory and vertex work still overlaps. Only a barrier with `ORDER_PRIMITIVES` or `ORDER_INDIRECT_DATA` (`g_game_barrier_all`) forces the full one; `g_game_barrier` keeps its meaning for the slice merge. Ocarina of Time, M1 Max on AC, gameplay at frame hold off, two runs each: frame 23.2-23.6 → 21.6-21.9 ms, GPU 22.0-22.3 → 20.2-20.4 ms, about 68 of 103 entry barriers a frame saved, same-buffer render gaps 141 → 72 a frame; the picture as before.
+- **Open:** the other games with `draw_barriers game` (Breath of the Wild and others) now also skip the full barrier after fragment-only barriers, as NVN allows; they were not run on this change. About 37 full entry barriers a frame remain in Ocarina of Time, from `ORDER_PRIMITIVES` barriers and compute in between.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#found-on-this-game).
+
 ### Dynamic resolution at its floor while the GPU has time to spare
 
 - **Symptom:** after a loading screen the game's resolution stays at its lowest (Ocarina of Time: 683x384) for minutes while it holds 60 fps with GPU time well under the frame, and climbs back only slowly or not at all.
@@ -612,6 +628,18 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Result on Ocarina of Time, an M6:** no measurable change. Its 4,758 marked pixel shaders were rebuilt with each load over the same library (chain `f9f01e4f9994`), and the game was measured standing on the Kokiri Forest deck, 40 s a run. GPU p50 was 14.38 ms with either load (5 runs plain, 13.99–14.88; 4 atomic, 14.28–15.34). The pictures matched within run-to-run noise. The gain the contributor measured is on an iPad Pro M5 and is not checked here.
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), reported with the iPad figures by a contributor in [discussion #1789](https://github.com/seedds/nxnative/discussions/1789).
 
+### Texture views made again every frame for render targets on new texture objects
+
+The cache's own lock also protects the empty-count check on retirement. Eviction never writes more pointers than its temporary list allocated, and a failed list allocation does not permit a new set past the 4,096-set cap. These guards do not change which texture or view a draw reads.
+
+- **Symptom:** a GPU-bound game whose GPU still sits idle at the start of each frame, waiting for the replay; in a CPU sample of the replay thread, `newTextureViewWithPixelFormat:` under `tex_by_id` ← `pool_entry` ← `encode_args` (5 % of the thread, 0.9 ms a frame), and the log's `texture views by texture` line counting dozens of views made per frame for as long as the game runs.
+- **Cause:** a view that only swizzles or reformats a texture is cached by the game's texture object (`vc_get`, by serial), and the entry goes when that object is finalized. A game that makes its render targets on new texture objects every frame over storage that stays, or finalizes the objects and keeps their texture IDs registered, never hits it, though the host resolves those objects to the same Metal textures frame after frame. Ocarina of Time: 77 views a frame of 39 Metal textures (depth, R11G11B10, R8 and R32F targets read through their format's swizzle), every one made again each frame.
+- **Fix:** general: a second cache by the Metal texture itself, behind the first (`vb_get` / `vb_put` in `nvn_mtl.m`). A view holds its parent, so an entry goes when the host retires the Metal texture (`defer_obj_at`, so a recycled render-target heap is not kept waiting) or has gone 120 frames unused. Textures uploaded from guest memory stay out of it: a finalized one is uploaded again as a new Metal texture, and its views would hold every upload.
+- **Measured:** Ocarina of Time on an M4 Pro, headless in a GPU-bound Hyrule Field scene: no view made in three consecutive frames (77 a frame before), 1,392–1,479 made in a whole 95 s run against 8,177; the replay's CPU 7.1–7.9 → 6.1–6.3 ms a frame (71–76 M → 59–61 M instructions); the time with no command buffer of the game on the GPU 1.4–1.8 → 1.16–1.20 ms a frame; 52.2–53.4 → 55.3–55.8 fps with encoding on the replay thread (three runs a side), pictures alike.
+- **Check:** `make -C dm/gfx/tests GAME=<id> check_t_view_cache` (a new texture object over the same storage, and the ID of a finalized one, get the view made before; the entry goes with a retired Metal texture and after 120 frames unused; an uploaded texture's views stay out), and `check_t_cpu_tex` (the descriptor and view lifetimes it checks hold).
+- **Not checked:** other games (no `scripts/regress.py check` run: Ocarina of Time was the only game built on the Mac it was measured on); iOS.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#frame-rate).
+
 ### Archive searches repeated while the build table is full
 
 - **Symptom:** a busy scene runs far below what its GPU time allows, with the main thread busy for most of each second. The `pipelines up to frame` line shows archive lookups that found none in the thousands per 300 frames, at about 3 ms each, many draws with a hybrid pipeline, and `in flight 384`. Ocarina of Time's castle town market: 9,208 searches, 30.5 s in 300 frames, CPU translation 114 ms a frame.
@@ -627,3 +655,83 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Fix:** general, in the host (`nvn_mtl.m`, `pso_base_made`, `g_pp_easy`): the prediction first asks whether a proposed key's base is made. If it is, the key needs no compile and no stand-in: nothing is made or handed to the background for it, and it is left out of later predictions' candidates, where it used to fill the 160 places for alternatives. Open: a proposed key with no base made still gets its stand-in made on the submit thread, an archive lookup each; on a first visit with no prewarm row that is the lookup its draw does next, but for a key that is not drawn it is wasted.
 - **Check:** `make -C dm/gfx/tests GAME=<id> check_t_pso_depth_stencil`: with a draw's pipeline cached, the prediction hands nothing over for its attachment-free variant, asks no archive, makes no pipeline, and proposes it once only; without Metal 4 bases it builds it as before. On the castle town route the same three predictions took 0.5, 2.0 and 1.4 ms, with 1 pulling pipeline made.
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#frame-rate).
+
+### GPU pass labels and diagnostic draw-group timing
+
+- **Symptom:** a hot profile line names only a render-target size; assigning its whole time to one shader or dividing it by draw count can misidentify the bottleneck.
+- **Cause:** relaxed GPU timestamps measure an encoder, often containing many different materials and mesh programs, rather than each shader independently.
+- **Fix:** the first ordinary draw of a profiled encoder records fragment, vertex, mesh and task keys in its `gp_lab`, printed after the existing format fields. Unsplit profiling preserves the pass structure. Optional `DM_NVN_GPUPROF_SPLIT=<n>`, adapted from PR #2094, ends the pass after groups of ordinary draws that reach the full draw path; fast multi-draw continuations can exceed that count. It does not split readable-tile or deferred replay passes. The extra attachment loads/stores change the timings substantially, so the split run is a diagnostic for shader groups, not a replacement for the unsplit frame measurement. A first-draw label is not proof that the encoder contains only that shader.
+- **Check:** `t_gpuprof`, `test_gpuprof` and a real Mac run in both modes. The [Ocarina of Time finding](../../dm/games/0400486024DEC000/README.md) records the substantial extra pass traffic and why split timings cannot be presented as original per-shader costs.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), M5 central-village pass breakdown.
+
+### Acquire-wait telemetry measures elapsed pacing time
+
+- **Symptom:** `DM_NVN_TSV` reports zero `@wait_ms` while acquire can wait for a display-link tick, or reports a planned fallback delay instead of the wait actually taken.
+- **Cause:** acquire accumulated the texture's fallback availability deadline difference, which is not the elapsed display-link or snapshot-capacity wait.
+- **Fix:** [PR #1158](https://github.com/seedds/nxnative/pull/1158) accumulates the already measured `pace_ns`. Present-queue waiting remains separate in `@pq_wait_ms`. This changes accounting, not pacing or rendering. Older zero `@wait_ms` values do not prove that acquire never blocked.
+- **Check:** the controlled-clock `t_link_ticks` case sets a zero fallback deadline and advances time through a real display-link wait; recorded waiting must match elapsed time. Tick conversion and snapshot cases still pass.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), M5 HDR movement-tail investigation; upstream first found the diagnostic error in an iPhone trace of Donkey Kong Bananza.
+
+### Ready queue pieces prefer the current work class
+
+- **Symptom:** the GPU's first-to-last work spans materially more time than its command-buffer durations add up to, while replay alternates render and compute pieces from independent NVN queues.
+- **Cause:** round robin switches classes even when another ready piece could continue the current class. This can add queue handovers and GPU scheduling gaps; the duration difference alone is not a precise measure of hardware idle or proof of its cause.
+- **Fix:** experimental `DM_NVN_QDEFER=1` (or `ab`), off by default, adapts [PR #2523](https://github.com/seedds/nxnative/pull/2523). It chooses only ready nodes whose original event/sync gates passed, never changes order within a queue, and prefers a ready wait or the current class over a ready piece of the other class. A held piece runs when no alternative qualifies, before a present or a later frame, under CPU fence-wait pressure, or at its fairness-age cap (`DM_NVN_QDEFER_US`, default 3000). It does not wait for future work, encode past an event, skip dispatches or read pointed-to guest data early. Disabled policy and zero-time CPU polls add no pressure wakeup. Queue activation also clears the previous queue's relaxed-render-pass state: a new queue's vertex/indirect reads must not inherit that proof. Statistics count classified pieces and class changes between pieces, not switches inside one piece.
+- **Check:** event and lifetime tests run with the policy, the encode thread and copied-command preparation in combination. Policy cases cover classification, ready bookkeeping, CPU pressure, present/frame boundaries and the cap. `t_queue_origin` checks a full barrier after changing queues with the game-barrier path enabled. Performance and platform limits belong to the linked game note; the upstream measurements were on a different M2 build, not this host.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), M5 original-network HDR movement-tail experiment.
+
+### Preparing copied command records while queues wait
+
+- **Symptom:** replay repeatedly scans copied command opcodes to find a possible later compute dispatch, while the queue worker also has idle periods waiting for NVN events.
+- **Cause:** the prescan is repeated on the ready replay path. Replaying ahead of an event, or snapshotting uniforms, indirect records or textures before it, would instead change what the game observes.
+- **Fix:** experimental `DM_NVN_PREPARE_COMMANDS=1`, off by default, lets the queue worker prepare only node-owned copied opcode records when every queue is blocked. It reads inline barrier bits and records prescan answers by byte offset; it does not follow guest pointers, replay commands, touch Metal, release events or publish receipts. The normal event gate must still pass before replay uses a plan. Calls, jumps, multi-draw expansion, return stacks, malformed records and unsupported offsets fall back to the original scan. The original 4096-op scan budget is preserved. Plans are freed with their owning nodes; the queue mutex is released during preparation. A wait becoming ready during this CPU work may still pay its remaining scan time, so the optimization must be measured rather than assumed beneficial.
+- **Check:** `t_command_prepare` covers inaccessible pointed-to data, dispatch/barrier decisions, scan-budget boundaries and malformed records. Queue event and lifetime tests run with preparation enabled, including guest inputs modified after enqueue and before a CPU event release. This is narrower than speculative rendering preparation proposed upstream: no GPU work or guest-data gathering crosses a wait. In-game counters report plans, cache hits and preparation cost.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), M5 HDR frame experiments.
+
+### Locality in GPU-written page tracking
+
+- **Symptom:** submission CPU work spends time probing GPU-written page slots and scanning a mostly empty staging table at commit.
+- **Cause:** independently hashing consecutive pages destroys locality, and a full-table commit walk scales with capacity rather than the number of changed entries.
+- **Fix:** [PR #2458](https://github.com/seedds/nxnative/pull/2458) keeps adjacent pages within a 256-MB region in neighboring hash slots and lists the staging slots occupied by this submission. Commit visits that list. GPU/CPU visibility and conflict semantics stay unchanged.
+- **Check:** `t_sbw` and running-uniform tests cover visibility and updates. A full ten-minute Ocarina comparison reduced submission CPU cost without a measurable frame-rate gain; CPU savings alone do not establish a shorter GPU/display critical path.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), M5 original-network HDR village scene.
+
+### A game dispatch after rendering waits for its explicit dependency
+
+- **Symptom:** a render-to-compute transition waits for all earlier rendering even for a dispatch independent of it.
+- **Cause:** the relaxed render end still included dispatch in its consumer stages, and every newly opened copy/compute encoder used an all-stage consumer barrier.
+- **Fix:** experimental `DM_NVN_COMPUTE_GAME_BAR=1` (or `ab`), off by default, adapts PR #2515. Only a game's dispatch immediately after relaxed rendering in the same submission and segment may use a selective start barrier. Any game barrier retains rendering dependencies; dispatch/copy ordering and alias visibility remain. Host kernels, copies, intervening encoders, queue switches, new submissions and segments keep full ordering. The render end includes object, mesh, vertex and fragment sources. This does not remove work or change shaders.
+- **Check:** `t_compute_after_render` verifies actual atomic fragment writes read by compute after a replayed game barrier, independent compute data, host and copy opens, queue switches, submission and segment boundaries, with the switch on/off and direct/deferred encoding under Metal validation. Full graphics regression and game performance are required separately.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), M5 scheduling experiments; the upstream M1 gain is not a measurement on this host.
+
+### A small first segment without shrinking every segment
+
+- **Symptom:** the GPU receives a submission's first work late while smaller global cut sizes add too many command buffers.
+- **Cause:** a uniform draw-count cut threshold delays the first commit as well as later commits. An earlier-work busy gate can defer that first commit further.
+- **Fix:** experimental `DM_NVN_CUT_FIRST=1` (or `ab`), off by default, adapts PR #2526: the first segment uses the smaller of `DM_NVN_CUT_FIRST_N` (8) and the normal cut, while later segments retain `DM_NVN_CUT`. It must never delay an already smaller normal cut. The first eligible cut commits despite earlier work. `CUT=0` continues disabling draw-count cuts, and all existing safe pass-boundary/deferred-work guards, uniform-copy watermarks and final-fence ownership remain. The normal busy gate stays on later cuts.
+- **Check:** `t_cut_first` feeds cut boundaries while real GPU copies cross segments, verifies first/later thresholds, disabled cuts, final-fence completion and every copied byte in direct/deferred encoding. The early-segment counter establishes whether a game exercises it; it does not prove a speed gain.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), M5 scheduling experiments. The baseline already has `CUT_BUSY=0`, so the new local lever is the first-segment threshold.
+
+### The presenter owns a different deadline from acquire
+
+- **Symptom:** frame CPU work is on a different guest thread from acquire, while only acquire has declared a Mach frame deadline.
+- **Cause:** the acquire declaration applies to its calling OS thread, not to the separate presenter or replay worker. A log read on another thread does not establish the declared thread's policy.
+- **Fix:** experimental `DM_RT_PRESENT=1`, off by default, adapts PR #2484. A presenter different from the successful acquire-policy thread maintains its own thread-local 120-frame CPU window, declaring the larger of 1.25 times p90 and 1.1 times peak, capped at 90% of the period. A first or changed period gets an immediate bounded declaration. `DM_RT=0` disables it; fixed `DM_RT_COMP` is respected. Mach success and own-thread readback are logged. It does not elevate all workers or change guest time, waits or game speed.
+- **Check:** `t_rt_present` captures the actual production declaration payload with controlled CPU time, checking same/different threads, per-thread history, peaks, period changes, caps, fixed budgets, both opt-outs and rejected declarations. The test does not change the runner's real scheduling. Actual Mac scheduling and frame-time effects require gameplay measurement.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), M5 scheduling experiments; upstream observations were mainly on iOS.
+
+### Colour feedback scans in depth-only passes
+
+- **Symptom:** replay CPU stacks include framebuffer-feedback checks even for passes with no colour attachment.
+- **Cause:** after handling depth feedback separately, `fb_prepare` still resolves every sampled texture's serial under the registry lock before searching an empty colour-attachment list. Those lookups cannot produce a colour substitution.
+- **Fix:** enter only that colour-feedback loop when `R.rt.n` is nonzero. Depth feedback, pass splitting, depth-write tracking and the colour-pass path stay unchanged. This removes redundant CPU work; it does not omit geometry, disable feedback or change shaders.
+- **Check:** `t_feedback` checks actual copied Depth32Float and Depth32Float_Stencil8 values in depth-only and colour passes, including a clear pending when the snapshot is requested. Performance benefit requires a separate matched measurement; inclusive stack samples are not exclusive milliseconds.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), M5 HDR movement-tail CPU sampling.
+
+### Submission boundaries waiting for the encode thread
+
+- **Symptom:** with deferred Metal encoding enabled, the wait ledger reports many `encode thread drain` waits per frame while the game still misses its display deadline.
+- **Cause:** `mtl_sub_commit` published its final commit and fence records, then waited for the entire encode FIFO to become idle. The submit worker could not translate the next ready submission during that tail, even though all encoder calls, commits and signals were already ordered records. This is distinct from waiting for an NVN event or the GPU.
+- **Fix:** experimental `DM_NVN_ENC_ASYNC=1`, off by default, changes only this submission-end drain to publication. Records retain their objects, render descriptors are copied, and allocators are reset only after their GPU fences pass. The same FIFO orders later submissions and present copies. Hard drains before another queue or synchronous encoding results remain; uniform copies still precede their commit. The NVN queue worker still selects only ready work: no replay past a guest event, early guest-memory reads, timeout release or fabricated fence completion is introduced. Without `DM_NVN_ENC_THREAD`, the switch supplies no deferred work.
+- **Check:** `check_t_rec_sub_end` holds the encode worker at a submission boundary: publication returns while the worker is held, but does not complete its GPU fence. The default mode waits. Ninety-six later submissions release source buffers and exercise allocator reuse; every copied byte and the final fence are checked under Metal validation. The full graphics suite also runs with the switch enabled; existing queue and readback tests cover the retained hard waits. Game measurements and their limits belong in the game note.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), M5 whole-frame experiment.

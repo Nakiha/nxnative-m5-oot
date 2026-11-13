@@ -13,12 +13,14 @@ import unittest
 ROOT = Path(__file__).resolve().parents[3]
 TOOLS = ROOT / 'dm/gfx/tools'
 sys.path.insert(0, str(ROOT / 'dm/ios/tools'))
+sys.path.insert(0, str(TOOLS))
+import dmsh_chain  # noqa: E402
 import ios_metal  # noqa: E402
 
 
 def mac_metal():   # dmsh_build.py's MAC_METAL, read without running the script
     for n in ast.parse((TOOLS / 'dmsh_build.py').read_text()).body:
-        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'MAC_METAL' for t in n.targets): return ast.literal_eval(n.value)
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'MAC_METAL' for t in n.targets): return eval(compile(ast.Expression(n.value), '<MAC_METAL>', 'eval'), {'dmsh_chain': dmsh_chain})
     raise AssertionError('no MAC_METAL in dmsh_build.py')
 
 

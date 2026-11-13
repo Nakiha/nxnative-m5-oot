@@ -574,8 +574,8 @@ static id<MTLFunction> mtk_nop_fragment(void) {
 }
 // The Metal 4 descriptor of a native mesh pipeline, whole: no base with open colour state, as a game has some hundred of them, each with functions of its own. Its depth / stencil
 // formats are not named (Metal 4 pipelines serve any). nil when a function has no Metal 4 descriptor (fn4_of: the diagnostic fragment overrides)
-static MTL4MeshRenderPipelineDescriptor *mtk_desc4(MTLRenderPipelineDescriptor *d, NvShader *ts, NvShader *ms, id<MTLFunction> ff, int border) {
-    MTL4FunctionDescriptor *mf = fn4_of_b(ms->fn, !border), *of = ts ? fn4_of_b(ts->fn, !border) : fn4_of(ms->mesh_obj), *f4 = fn4_of_b(ff, !border);
+static MTL4MeshRenderPipelineDescriptor *mtk_desc4(MTLRenderPipelineDescriptor *d, NvShader *ts, NvShader *ms, id<MTLFunction> ff, int border, int scratch) {
+    MTL4FunctionDescriptor *mf = fn4_of_b(scratch ? ms->mesh_sfn : ms->fn, !border), *of = ts ? fn4_of_b(ts->fn, !border) : fn4_of(scratch ? ms->mesh_sobj : ms->mesh_obj), *f4 = fn4_of_b(ff, !border);
     if (!mf || !of || !f4) return nil;
     MTL4MeshRenderPipelineDescriptor *m = [MTL4MeshRenderPipelineDescriptor new];
     m.meshFunctionDescriptor = mf; m.fragmentFunctionDescriptor = f4; m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
@@ -593,11 +593,13 @@ static MTL4MeshRenderPipelineDescriptor *mtk_desc4(MTLRenderPipelineDescriptor *
 static id<MTLRenderPipelineState> mtk_build(const pso_key *k, NvShader *ts, NvShader *ms, NvShader *fs, NSError **error, int *archived) {
     if (archived) *archived = 0;
     if (!k || !ms || !ms->fn || (!ts && !ms->mesh_obj)) return nil;
+    int scratch = k->mesh_scratch != 0;
+    if (scratch && (ts || !ms->mesh_scratch || !ms->mesh_sfn || !ms->mesh_sobj)) return nil;
     MTLRenderPipelineDescriptor *d = pso_desc(k, nil, fs, nil, 0);
     if (!pso_ds_valid((uint32_t)d.depthAttachmentPixelFormat, (uint32_t)d.stencilAttachmentPixelFormat)) return nil;
     id<MTLFunction> ff = d.fragmentFunction ?: mtk_nop_fragment();
     pso4_init();
-    MTL4MeshRenderPipelineDescriptor *m4 = g_comp4 ? mtk_desc4(d, ts, ms, ff, k->border) : nil;
+    MTL4MeshRenderPipelineDescriptor *m4 = g_comp4 ? mtk_desc4(d, ts, ms, ff, k->border, scratch) : nil;
     if (m4) {
         id<MTLRenderPipelineState> ps = nil; int from_run = 0;
         ps = arch_lookup(m4, 0, &from_run);   // a period of mesh pipelines alone is a p file (no vertex layout)
@@ -608,8 +610,8 @@ static id<MTLRenderPipelineState> mtk_build(const pso_key *k, NvShader *ts, NvSh
         }
     }
     MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
-    m.meshFunction = fn_dev_b(ms->fn, !k->border); m.fragmentFunction = fn_dev_b(ff, !k->border); m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
-    m.objectFunction = ts ? fn_dev_b(ts->fn, !k->border) : fn_dev(ms->mesh_obj); m.payloadMemoryLength = ts ? (ts->mesh_payload + 15u) & ~15u : 16; m.maxTotalThreadsPerObjectThreadgroup = ts ? ts->mesh_threads : 1;
+    m.meshFunction = fn_dev_b(scratch ? ms->mesh_sfn : ms->fn, !k->border); m.fragmentFunction = fn_dev_b(ff, !k->border); m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
+    m.objectFunction = ts ? fn_dev_b(ts->fn, !k->border) : fn_dev(scratch ? ms->mesh_sobj : ms->mesh_obj); m.payloadMemoryLength = ts ? (ts->mesh_payload + 15u) & ~15u : 16; m.maxTotalThreadsPerObjectThreadgroup = ts ? ts->mesh_threads : 1;
     m.rasterSampleCount = d.rasterSampleCount; m.alphaToCoverageEnabled = d.alphaToCoverageEnabled;
     for (int i = 0; i < 8; i++) m.colorAttachments[i] = d.colorAttachments[i];
     m.depthAttachmentPixelFormat = d.depthAttachmentPixelFormat; m.stencilAttachmentPixelFormat = d.stencilAttachmentPixelFormat;
@@ -627,11 +629,12 @@ static void mtk_claim(pso_key *k, NvShader *ts, NvShader *ms, NvShader *fs, id<M
     id current = hm_get_id(&g_pso_mtk, k);
     if (!current || current == NSNull.null) hm_put_id(&g_pso_mtk, k, ps);
 }
-static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
+static id<MTLRenderPipelineState> mtk_pso_mode(NvProg *raster, int scratch) {
     if (!raster || !g_mtk.ms || !g_mtk.ms->fn) return nil;
     NvShader *ts = g_mtk.ts, *ms = g_mtk.ms, *fs = raster->sh[1];
     pso_key k; pso_key_fill(&k, ms, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, 0);
     k.border |= border_need(ts, 3);
+    k.mesh_scratch = scratch != 0;
     memset(k.attr, 0, sizeof k.attr); memset(k.attr_hi, 0, sizeof k.attr_hi); memset(k.stream, 0, sizeof k.stream);
     mtk_bind_key(&k, ts, ms, fs);
     id ps = hm_get_id(&g_pso_mtk, &k);
@@ -655,6 +658,17 @@ static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
          elapsed / 1e6, archived ? " (from the pipeline archive)" : "", (unsigned long long)atomic_load(&g_cur_frame));
     return ps;
 }
+static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) { return mtk_pso_mode(raster, 0); }
+// Four independent regions per encoder. Only a mesh-stage completion barrier permits their reuse; a new encoder or a larger stride gets a new fence-owned arena allocation.
+static uint64_t mesh_stage_region(id<MTL4RenderCommandEncoder> en, unsigned cap, unsigned stride) {
+    enum { REGIONS = 4 }; static uint64_t pass, base; static unsigned region, capacity, step;
+    if (pass != g_pass.serial || capacity != cap || step < stride) {
+        id<MTLBuffer> b; size_t off = arena_alloc((size_t)cap * stride * REGIONS, &b); g_cur_arena->transient = 1;
+        pass = g_pass.serial; base = b.gpuAddress + off; region = 0; capacity = cap; step = stride;
+    }
+    if (region == REGIONS) { [en barrierAfterEncoderStages:MTLStageMesh beforeEncoderStages:MTLStageMesh visibilityOptions:MTL4VisibilityOptionDevice]; region = 0; }
+    return base + (uint64_t)region++ * capacity * step;
+}
 static void mtk_encode(id<MTLRenderCommandEncoder> en_) {
     id<MTL4RenderCommandEncoder> en = (id<MTL4RenderCommandEncoder>)en_; NvShader *ts = g_mtk.ts, *ms = g_mtk.ms;
     [en setArgumentTable:g_vt atStages:MTLRenderStageMesh];
@@ -666,6 +680,20 @@ static void mtk_encode(id<MTLRenderCommandEncoder> en_) {
     g_args_dirty[4] = 1; encode_args(en, ms, 4, 1);
     // A task shader's threadgroups are the draw's workgroups; with no task, the object function's are blocks of DMSH_MESH_GRID of them (mdx_mask writes their count at +16)
     MTLSize to = MTLSizeMake(ts ? ts->mesh_threads : 1, 1, 1), tm = MTLSizeMake(ms->mesh_threads, 1, 1);
+    unsigned cap = mesh_scratch_cap();
+    id<MTLRenderPipelineState> scratch_ps = cap && !ts && ms->mesh_scratch && (g_mtk.ind || g_mtk.count <= cap) ? mtk_pso_mode(g_geo_program, 1) : nil;
+    if (scratch_ps) {
+        // Concurrent draws own disjoint regions. Reuse is ordered after every previous mesh read; the arena itself stays alive until its submission's GPU fence.
+        uint64_t addr = mesh_stage_region(en, cap, ms->mesh_scratch);
+        if (rec_on()) rec_table_op(RO_T_ADDR, g_vt, addr, DMSH_MESH_SCRATCH_SLOT); else [g_vt setAddress:addr atIndex:DMSH_MESH_SCRATCH_SLOT];
+        if (g_mtk.ind) [en drawMeshThreadgroupsWithIndirectBuffer:g_mtk.ind + 32 threadsPerObjectThreadgroup:to threadsPerMeshThreadgroup:tm];   // overflow: unchanged original draw
+        [en setRenderPipelineState:scratch_ps];
+        g_enc_pso = nil;   // draw_ cached the native pipeline; the next draw must restore its own after this alternate entry
+        if (g_mtk.ind) [en drawMeshThreadgroupsWithIndirectBuffer:g_mtk.ind + 48 threadsPerObjectThreadgroup:to threadsPerMeshThreadgroup:tm];
+        else [en drawMeshThreadgroups:MTLSizeMake((g_mtk.count + DMSH_MESH_GRID - 1) / DMSH_MESH_GRID, 1, 1) threadsPerObjectThreadgroup:to threadsPerMeshThreadgroup:tm];
+        static int once; if (!once++) MLOG("draw-private mesh stage: capacity %u, stride %u; overflowing indirect draws stay native (DM_NVN_MESH_SCRATCH)", cap, ms->mesh_scratch);
+        return;
+    }
     if (g_mtk.ind) [en drawMeshThreadgroupsWithIndirectBuffer:g_mtk.ind + (ts ? 0 : 16) threadsPerObjectThreadgroup:to threadsPerMeshThreadgroup:tm];
     else [en drawMeshThreadgroups:MTLSizeMake(ts ? g_mtk.count : (g_mtk.count + DMSH_MESH_GRID - 1) / DMSH_MESH_GRID, 1, 1) threadsPerObjectThreadgroup:to threadsPerMeshThreadgroup:tm];
 }

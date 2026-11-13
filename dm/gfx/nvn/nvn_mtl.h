@@ -35,6 +35,12 @@ void mtl_res_snapshot(mtl_res_count *out);
 
 // One submit: begin -> several operations -> commit (returns the fence value at which this submit completes)
 void mtl_prepare(void);                                // the first submission's prepare step (prewarm, pipeline prebuild): no GPU work, called outside the graphics gate
+struct nvn_command_plan;
+int mtl_commands_prepare_enabled(void);
+struct nvn_command_plan *mtl_commands_prepare(const void *bytes, size_t length);   // copied command records only, safe while their queue is parked
+void mtl_commands_use(struct nvn_command_plan *plan);
+void mtl_commands_free(struct nvn_command_plan *plan);
+void mtl_commands_stats(uint64_t *plans, uint64_t *hits, uint64_t *build_ns);
 void mtl_sub_begin(void);
 void mtl_queue_activate(uint64_t serial);              // submit lock held: restore this queue's persistent GPU state
 void mtl_queue_forget(uint64_t serial);                // finalize: discard its state, including guest object pointers

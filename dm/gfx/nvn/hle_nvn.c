@@ -1783,8 +1783,10 @@ NVN(nvnWindowGetCrop, void, const NVNwindow *w, NVNrectangle *r) {   // Bayonett
 static void trow(uint64_t f, const char *name, double v);
 static void set_time_constraint(uint64_t period_ns);
 static void rt_comp_tick(uint64_t period_ns);
+static void rt_present_tick(uint64_t period_ns);
 static double g_rt_comp_ms;   // Currently declared real-time computation amount (ms; 0 = not declared)
 static double g_rt_period_ms;
+static _Atomic uint64_t g_rt_acq_tid;   // the thread whose acquire declaration succeeded
 static void sleep_until_ns(uint64_t dl);
 static uint64_t present_period(const win_t *o);
 static uint64_t rt_period_ns(const win_t *o, uint64_t period);
@@ -1830,7 +1832,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         if (pace) { if (last && now_ns() < last + step) sleep_until_ns(last + step); last = now_ns(); }
     }
     pace_ns += mtl_snap_acquire_wait();   // ring capacity is waited for at acquire, where the game does not hold its present lock
-    g_acq_wait_ns += wait; trow(g_frame, "@late_ms", wait ? (now_ns() - at) / 1e6 : 0);
+    g_acq_wait_ns += pace_ns; trow(g_frame, "@late_ms", wait ? (now_ns() - at) / 1e6 : 0);   // elapsed pacing, including display-link/ring waits; the fallback deadline alone can be zero (PR #1158)
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
     if (tk) { uint64_t w0 = now_ns(); nvn_queue_present_wait(tk); nvn_queue_present_release(tk); o->ticket[*idx]=0; g_pq_wait_ns += now_ns() - w0; }
@@ -1940,6 +1942,15 @@ static void power_line(uint64_t frame) {
         double nf = frame > pf ? (double)(frame - pf) : 1;   // per frame: the fair comparison when one build holds the frame rate better than another
         LOG("[nvn] power up to frame %llu: CPU energy %.2f W, %.1f mJ per frame (%.1f fps); CPU %.0f%% (100 = one core), %.0f%% of it on performance cores; wakeups %.0f/s (out of platform idle %.0f); GPU %.1f ms/s; thermal %d; top yielders: %s", frame,
             (e - pe) / 1e9 / s, (e - pe) / 1e6 / nf, nf / s, (cpu - pcpu) / 1e7 / s, cpu > pcpu ? 100.0 * (double)(p - pp) / (double)(cpu - pcpu) : 0, (iw - piw) / s, (idw - ppw) / s, (g - pg) / 1e6 / s, dm_thermal_now(), yt);
+        { static uint64_t pd[NQD_N+1]; uint64_t d[NQD_N+1]; nq_defer_stats(d);
+          if(d[NQD_N]!=pd[NQD_N] || d[NQD_DEFER]!=pd[NQD_DEFER]) LOG("[nvn] queue defer up to frame %llu, per frame: pieces held %.2f, ready alternatives %.2f; released: no alternative %.2f, cap %.2f, present %.2f, later frame %.2f, other class %.2f",
+            frame,(d[NQD_N]-pd[NQD_N])/nf,(d[NQD_DEFER]-pd[NQD_DEFER])/nf,(d[NQD_RUN_NONE_ELSE]-pd[NQD_RUN_NONE_ELSE])/nf,
+            (d[NQD_RUN_CAP]-pd[NQD_RUN_CAP])/nf,(d[NQD_RUN_BEFORE_PRESENT]-pd[NQD_RUN_BEFORE_PRESENT])/nf,(d[NQD_RUN_LATER_FRAME]-pd[NQD_RUN_LATER_FRAME])/nf,(d[NQD_RUN_OTHER_CLASS]-pd[NQD_RUN_OTHER_CLASS])/nf);
+          memcpy(pd,d,sizeof pd); }
+        { static uint64_t previous[4]; uint64_t counts[4]; nq_class_stats(counts);
+          LOG("[nvn] replay classes up to frame %llu, per frame: render %.2f, compute %.2f, mixed %.2f pieces; switches between pieces %.2f",frame,
+              (counts[0]-previous[0])/nf,(counts[1]-previous[1])/nf,(counts[2]-previous[2])/nf,(counts[3]-previous[3])/nf);
+          memcpy(previous,counts,sizeof previous); }
         char rs[400]; mtl_res_stats(rs, sizeof rs); static uint64_t pbs, pbf; uint64_t bs, bf; mtl_barrier_stats(&bs, &bf);
         uint64_t mtl_cut_count(void), mtl_copy_cut_count(void), mtl_blit_splits(void); void mtl_ubd_stats(uint64_t *, uint64_t *); static uint64_t pcut, pccut, pbsp, pud, puc; uint64_t cut = mtl_cut_count(), ccut = mtl_copy_cut_count(), bsp = mtl_blit_splits(), ud, uc; mtl_ubd_stats(&ud, &uc);
         void mtl_ubp_stats(uint64_t *, uint64_t *, uint64_t *); static uint64_t ppm, ppr, ppf; uint64_t pm, pr, pf_; mtl_ubp_stats(&pm, &pr, &pf_);
@@ -1948,6 +1959,8 @@ static void power_line(uint64_t frame) {
         uint64_t ld, st, fu, udc = mtl_udc_saved_bytes(); mtl_bw(&ld, &st, &fu);
         void mtl_sm_stats(uint64_t *, uint64_t *, uint64_t *); static uint64_t psmp, psmc, psmw; uint64_t smp, smc, smw; mtl_sm_stats(&smp, &smc, &smw);
         void mtl_cshoist_stats(uint64_t *, uint64_t *, uint64_t *); static uint64_t pchm, pchd, pchs[8]; uint64_t chm, chd, chs[8]; mtl_cshoist_stats(&chm, &chd, chs);
+        if (mtl_commands_prepare_enabled()) { uint64_t plans,hits,ns; mtl_commands_stats(&plans,&hits,&ns);
+            LOG("[nvn] copied-command preparation up to frame %llu: %llu idle plans, %llu cached prescans, %.3f ms total preparation",frame,(unsigned long long)plans,(unsigned long long)hits,ns/1e6); }
         LOG("[nvn] residency set up to frame %llu: %s; draw-pass entry barriers full %llu / saved %llu; split submits %llu (%llu after buffer → texture copies); passes broken by copies / buffer updates %llu; in-pass uniform updates deferred %llu, passes ended to land them for a read %llu, partly covered blocks read from memory %llu (cached %llu, refused %llu: other GPU writes %llu, earlier submission running %llu, a report still to land %llu, copy or fill queued %llu, size %llu, unreadable %llu); waiting clears taken by a later pass %llu, landed in passes of their own %llu; slice-merged passes %llu (layer switches taken in %llu, waits for an amplified pipeline %llu); compute dispatches moved ahead of their pass %llu (sampling its depth %llu; "
             "scans stopped by a draw %llu, a dispatch %llu, a read of its writes %llu, depth written before it %llu, another op %llu); attachments per frame load %.0f MB / store %.0f MB, load-all store-all passes %.0f, saved by not storing unwritten attachments %.1f MB", frame, rs, (unsigned long long)(bf - pbf), (unsigned long long)(bs - pbs),
             (unsigned long long)(cut - pcut), (unsigned long long)(ccut - pccut), (unsigned long long)(bsp - pbsp), (unsigned long long)(ud - pud), (unsigned long long)(uc - puc), (unsigned long long)(pm - ppm), (unsigned long long)(pr - ppr), (unsigned long long)(pf_ - ppf), (unsigned long long)(w5[1] - pw5[1]), (unsigned long long)(w5[2] - pw5[2]), (unsigned long long)(w5[5] - pw5[5]), (unsigned long long)(w5[3] - pw5[3]), (unsigned long long)(w5[0] - pw5[0]), (unsigned long long)(w5[4] - pw5[4]), (unsigned long long)(lt - plt), (unsigned long long)(ll - pll), (unsigned long long)(smp - psmp), (unsigned long long)(smc - psmc), (unsigned long long)(smw - psmw), (unsigned long long)(chm - pchm), (unsigned long long)(chd - pchd),
@@ -2071,7 +2084,7 @@ static void set_time_constraint_comp(uint64_t period_ns, uint64_t comp_ns) {
         .period = (uint32_t)(period_ns * tb.denom / tb.numer), .computation = (uint32_t)(comp_ns * tb.denom / tb.numer),
         .constraint = (uint32_t)(period_ns * tb.denom / tb.numer), .preemptible = 1};
     kern_return_t kr = thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&p, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
-    if (kr == KERN_SUCCESS) { g_rt_comp_ms = comp_ns / 1e6; g_rt_period_ms = period_ns / 1e6; }
+    if (kr == KERN_SUCCESS) { g_rt_comp_ms = comp_ns / 1e6; g_rt_period_ms = period_ns / 1e6; uint64_t tid; pthread_threadid_np(NULL, &tid); atomic_store(&g_rt_acq_tid, tid); }
     LOG("[nvn] present thread time-constraint policy (period %.3f ms, computation %.3f ms) %s", period_ns / 1e6, comp_ns / 1e6, kr == KERN_SUCCESS ? "set" : "failed to set");
 }
 static int rt_comp_fixed_ms(void) { static int v = -2; if (v == -2) { const char *e = getenv("DM_RT_COMP"); v = e && *e && strcmp(e, "auto") ? atoi(e) : -1; } return v; }   // −1 = auto
@@ -2089,6 +2102,40 @@ static void rt_comp_tick(uint64_t period_ns) {
     // two frames in 120 near 4.4 ms; declared at 2.5 ms (p90 × 1.25) it stalled about once a second, at 30 fps and at 60; declared above the peak it held 60 fps at the same CPU energy
     double p90 = v[107], comp = fmax(p90 * 1.25, v[119] * 1.1), cap = period_ns * 0.9 / 1e6; if (comp > cap) comp = cap; if (comp < 1) comp = 1;
     if (comp > g_rt_comp_ms * 1.15 || comp < g_rt_comp_ms * 0.85) set_time_constraint_comp(period_ns, (uint64_t)(comp * 1e6));
+}
+// PR #2484, opt-in here. Acquire and present can run on different guest threads.
+// Each presenter keeps its own CPU sample window; it neither borrows another
+// thread's budget nor changes guest time, priorities, fences or pacing.
+typedef struct { uint64_t last, period, declared_period; double win[120], declared; unsigned n; } rt_present_state;
+static _Thread_local rt_present_state g_rtp;
+static void rt_present_declare(uint64_t period_ns, double comp) {
+    double cap = period_ns * 0.9 / 1e6; if (comp < 1) comp = 1; if (comp > cap) comp = cap;
+    if (g_rtp.declared_period == period_ns && g_rtp.declared && comp <= g_rtp.declared * 1.15 && comp >= g_rtp.declared * 0.85) return;
+    mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+    thread_time_constraint_policy_data_t p = {
+        .period = (uint32_t)(period_ns * tb.denom / tb.numer), .computation = (uint32_t)(comp * 1e6 * tb.denom / tb.numer),
+        .constraint = (uint32_t)(period_ns * tb.denom / tb.numer), .preemptible = 1};
+    kern_return_t kr = thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&p, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    if (kr == KERN_SUCCESS) { g_rtp.declared = comp; g_rtp.declared_period = period_ns; }
+    uint64_t tid; pthread_threadid_np(NULL, &tid);
+    thread_time_constraint_policy_data_t actual = {0}; mach_msg_type_number_t count = THREAD_TIME_CONSTRAINT_POLICY_COUNT; boolean_t defaults = FALSE;
+    kern_return_t readback = thread_policy_get(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&actual, &count, &defaults);
+    LOG("[nvn] presenter deadline tid=%#llx acquire=%#llx period %.3f ms computation %.3f ms result=%d; readback=%d default=%d computation %.3f ms", (unsigned long long)tid, (unsigned long long)atomic_load(&g_rt_acq_tid), period_ns / 1e6, comp, kr, readback, defaults, readback == KERN_SUCCESS ? (double)actual.computation * tb.numer / tb.denom / 1e6 : 0);
+}
+static void rt_present_tick(uint64_t period_ns) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_RT_PRESENT"); on = e && atoi(e) > 0; }
+    if (!on || !rt_on() || !period_ns) return;
+    uint64_t tid; pthread_threadid_np(NULL, &tid); if (tid == atomic_load(&g_rt_acq_tid)) return;
+    uint64_t c = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID); int fixed = rt_comp_fixed_ms();
+    if (!g_rtp.last || g_rtp.period != period_ns) {
+        g_rtp.last = c; g_rtp.period = period_ns; g_rtp.n = 0;
+        rt_present_declare(period_ns, fixed > 0 ? fixed : g_rtp.declared ? g_rtp.declared : 2); return;
+    }
+    double elapsed = c >= g_rtp.last ? (c - g_rtp.last) / 1e6 : 0; g_rtp.last = c;
+    if (fixed > 0) { rt_present_declare(period_ns, fixed); return; }
+    g_rtp.win[g_rtp.n++] = elapsed; if (g_rtp.n < 120) return;
+    double v[120]; memcpy(v, g_rtp.win, sizeof v); qsort(v, 120, sizeof *v, dcmp); g_rtp.n = 0;
+    rt_present_declare(period_ns, fmax(v[107] * 1.25, v[119] * 1.1));
 }
 static void sleep_until_ns(uint64_t dl) {   // absolute time on the monotonic clock
     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
@@ -2387,6 +2434,7 @@ static const int *present_crop(const int win[4], int tw, int th, int lc[4]) {
 }
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++;
+    if (!dm_detclock_enabled()) rt_present_tick(rt_period_ns(o, present_period(o)));
     dm_ue_cvar_tick();
     if (fps_high()) high_cap_tick();
     if (dm_fps_state) __atomic_store_n((uint32_t *)(dm_fps_state + 4), (uint32_t)dm_movie_playing(), __ATOMIC_RELAXED);   // the stubs' copy of the movie state (hle.h)

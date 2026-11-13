@@ -171,6 +171,16 @@ int main(int argc, char **argv) {
     if (!info_string("CFBundleName", name, sizeof name)) snprintf(name, sizeof name, "nxnative");
     info_string("DMRomfsMarker", marker, sizeof marker); info_string("DMLanguage", lang, sizeof lang);
     if (!info_string("DMTitleID", id, sizeof id) || strchr(id, '/')) { alert(name, "This app has no title ID in its Info.plist (DMTitleID): pack it again with build_ipa_from_nsp.py --platform mac-app."); return 1; }
+    // A local experimental build can isolate data without changing the real
+    // title ID used by the guest. No path separators, dots or empty components.
+    char data_id[64], override_id[64]; snprintf(data_id, sizeof data_id, "%s", id);
+    if (info_string("DMDataID", override_id, sizeof override_id)) {
+        for (const unsigned char *s = (const unsigned char *)override_id; *s; s++)
+            if (!((*s >= 'A' && *s <= 'Z') || (*s >= 'a' && *s <= 'z') || (*s >= '0' && *s <= '9') || *s == '_' || *s == '-')) {
+                alert(name, "Invalid DMDataID: use only ASCII letters, digits, underscores and hyphens."); return 1;
+            }
+        snprintf(data_id, sizeof data_id, "%s", override_id);
+    }
     struct stat st; snprintf(p, sizeof p, "%s/romfs.img", res);
     int valid_romfs;
     if (!stat(p, &st)) {
@@ -183,10 +193,10 @@ int main(int argc, char **argv) {
     }
     const char *home = getenv("HOME"); if (!home || !*home) return 1;
     char sup[PATH_MAX], save[PATH_MAX], temp[PATH_MAX], logs[PATH_MAX], log[PATH_MAX], prev[PATH_MAX];
-    snprintf(sup, sizeof sup, "%s/Library/Application Support/nxnative/%s", home, id);
+    snprintf(sup, sizeof sup, "%s/Library/Application Support/nxnative/%s", home, data_id);
     snprintf(save, sizeof save, "%s/save", sup); snprintf(temp, sizeof temp, "%s/temp", sup);
     snprintf(logs, sizeof logs, "%s/Library/Logs/nxnative", home);
-    snprintf(log, sizeof log, "%s/%s.log", logs, id); snprintf(prev, sizeof prev, "%s/%s.prev.log", logs, id);
+    snprintf(log, sizeof log, "%s/%s.log", logs, data_id); snprintf(prev, sizeof prev, "%s/%s.prev.log", logs, data_id);
     mkdirs(save); mkdirs(temp); mkdirs(logs);
     rename(log, prev);
     int fd = open(log, O_WRONLY | O_CREAT | O_TRUNC, 0644);

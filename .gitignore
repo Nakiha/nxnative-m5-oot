@@ -11,3 +11,14 @@ dm/games/*/cb_extent.tsv
 .coverage
 .coverage.*
 /coverage.json
+# Local game inputs and generated app/build folders stay outside the source fork.
+*.nsp
+*.nsz
+*.xci
+*.xcz
+*.nup
+prod.keys
+title.keys
+*.app/
+*_build/
+*-work/

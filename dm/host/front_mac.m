@@ -33,6 +33,7 @@ static void merge_rumble_to_s2(int on);
 #include "ctrl_prompt.h"
 #include <signal.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <sys/stat.h>
 
 static CAMetalLayer *g_layer;
@@ -53,11 +54,48 @@ int front_display_pixels(int *w, int *h) {
 }
 static _Atomic int g_screen_variable_refresh;
 int front_screen_variable_refresh(void) { return g_screen_variable_refresh; }
+static int g_hdr_layer, g_hdr_peak;
+static _Atomic int g_hdr_available;
+int front_hdr_peak_nits(void) { return g_hdr_available ? g_hdr_peak : 0; }
+static void hdr_layer_setup(CAMetalLayer *layer, NSScreen *screen) {
+    const char *on = getenv("DM_HDR");
+    if (!on || strcmp(on, "1")) return;
+    const char *input = getenv("DM_HDR_INPUT");
+    if (!input || strcmp(input, "pq2020")) {
+        LOG("[RED] HDR experiment requires DM_HDR_INPUT=pq2020: no automatic input-color-space detection; keeping SDR"); return;
+    }
+    if (!screen || screen.maximumPotentialExtendedDynamicRangeColorComponentValue <= 1) {
+        LOG("HDR experiment: the starting display has no EDR headroom; keeping SDR (restart on an HDR display)"); return;
+    }
+    int peak = 1000; const char *p = getenv("DM_HDR_PEAK_NITS");
+    if (p) { char *end; long n = strtol(p, &end, 10);
+        if (!*p || *end || n < 203 || n > 10000) { LOG("[RED] DM_HDR_PEAK_NITS must be 203..10000; keeping SDR"); return; }
+        peak = (int)n;
+    }
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceITUR_2100_PQ);
+    if (!cs) { LOG("[RED] HDR experiment: cannot create the BT.2100 PQ color space; keeping SDR"); return; }
+    // Apple's "Using color spaces to display HDR content": a normalized 10-bit
+    // PQ layer, tagged BT.2020/PQ, rather than treating PQ codes as SDR RGB.
+    layer.pixelFormat = MTLPixelFormatBGR10A2Unorm;
+    layer.colorspace = cs; CGColorSpaceRelease(cs);
+    layer.wantsExtendedDynamicRangeContent = YES;
+    layer.EDRMetadata = [CAEDRMetadata HDR10MetadataWithMinLuminance:0 maxLuminance:peak opticalOutputScale:10000];
+    g_hdr_layer = 1; g_hdr_peak = peak; g_hdr_available = 1;
+    LOG("HDR experiment: BGR10A2 / BT.2020 PQ / EDR enabled, requested peak %d nits, paper white 203 nits; input encoding is an explicit experimental assumption, not detected", peak);
+    LOG("HDR display: %s, EDR current %.3f / potential %.3f / reference %.3f; these are relative headroom, not measured nits", screen.localizedName.UTF8String,
+        (double)screen.maximumExtendedDynamicRangeColorComponentValue, (double)screen.maximumPotentialExtendedDynamicRangeColorComponentValue,
+        (double)screen.maximumReferenceExtendedDynamicRangeColorComponentValue);
+}
 static void screen_refresh(NSScreen *screen) {   // main thread: refresh capabilities of the current screen and mode, including a mode change without moving the window
     if (!screen) return;
     g_screen_fps = (int)screen.maximumFramesPerSecond;
     g_screen_id = [screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
     g_screen_variable_refresh = screen.minimumRefreshInterval > 0 && screen.maximumRefreshInterval > screen.minimumRefreshInterval;
+    if (g_hdr_layer) {
+        int available = screen.maximumPotentialExtendedDynamicRangeColorComponentValue > 1;
+        if (atomic_exchange(&g_hdr_available, available) != available)
+            LOG("HDR experiment: current display %s; the PQ layer stays fixed and ColorSync handles display conversion", available ? "has EDR headroom" : "has no EDR headroom (game HDR disabled)");
+    }
 }
 static _Atomic int g_fullscreen;   // the window is in fullscreen (set when it has entered and when it has left)
 // The software keyboard input box is up (front_text_input). The game window is not key then, which is not a focus change the game should see: on hardware the inline keyboard is drawn inside
@@ -1528,6 +1566,7 @@ void front_run(void (*guest)(void)) {
         g_layer = [CAMetalLayer layer];
         g_layer.device = MTLCreateSystemDefaultDevice();
         g_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        hdr_layer_setup(g_layer, win.screen ?: NSScreen.mainScreen);
         g_layer.contentsScale = win.backingScaleFactor;
         // Apple's HUD over the game (frame rate, frame and GPU time, memory): front_hud_env turns it on before the first device. The layer's developerHUDProperties
         // stay unset: mode=default forces this layer's HUD on, so the Metal HUD menu's Hide HUD left it on screen

@@ -14,7 +14,8 @@ TOOLS = Path(__file__).resolve().parents[1] / 'tools'
 sys.path.insert(0, str(TOOLS))
 from dmsh_rewrite import gather_offsets, gather_quad   # noqa: E402
 # the Mac compile's flags, from the build's own line (dmsh_build.py runs a build when imported)
-MAC_METAL = next(ast.literal_eval(n.value) for n in ast.parse((TOOLS / 'dmsh_build.py').read_text()).body
+import dmsh_chain  # noqa: E402
+MAC_METAL = next(eval(compile(ast.Expression(n.value), '<MAC_METAL>', 'eval'), {'dmsh_chain': dmsh_chain}) for n in ast.parse((TOOLS / 'dmsh_build.py').read_text()).body
                  if isinstance(n, ast.Assign) and getattr(n.targets[0], 'id', None) == 'MAC_METAL')
 
 HEAD = '''#include <metal_stdlib>

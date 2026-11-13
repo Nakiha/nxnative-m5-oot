@@ -62,6 +62,8 @@ Settings a player chose in a front end and wants kept, also for a start from Fin
 
 **An IPA** is installed by the player (sideloading); its own settings screen starts the game. Lines in the app's `Documents/env.txt` win over that screen ([Settings in a file](settings.md#settings-in-a-file)). The save and `log.txt` are in the app's Documents folder.
 
+For an isolated local experiment, `pack_app.py --data-id NAME` writes the optional `DMDataID` key. It changes the Application Support directory and log basename only, not the guest's real `DMTitleID`. Names are limited to 1..63 ASCII letters, digits, underscores and hyphens. Use a separate bundle ID as well to isolate preferences. Existing apps without the key keep their paths. External diagnostic collectors that only inspect `DMTitleID` need the experiment's log supplied manually.
+
 ## Saved choices
 
 Each app keeps the player's choices in its own preferences domain, its bundle ID (`CFBundleIdentifier` in `Info.plist`, `org.nxnative.<title ID>` unless the app was packed with another): one string per setting, under the key `launcher.<env>` (`launcher.DM_FPS_TARGET` = `"30"`). The iPhone app's settings screen keeps them there, and a Mac app's launcher (`dm/mac/launcher.c`) reads them at every start, so a start from Finder or the Dock has them too. A front end writes the same keys (`CFPreferencesSetAppValue` with the app's bundle ID, or `defaults write org.nxnative.<title ID> launcher.DM_FPS_TARGET -string 30`), and a settings window inside the app would too: there is one set of choices, and every view of it agrees.

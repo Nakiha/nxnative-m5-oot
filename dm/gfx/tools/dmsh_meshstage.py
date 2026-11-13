@@ -130,7 +130,18 @@ def _type(width):
     return 'float' if width == 1 else f'float{width}'
 
 
-def to_stage(msl, i, reads=None):
+def _device_stage(msl):
+    """Move the stage body's shared array and its helpers to device memory, retaining the array template's overloads."""
+    lines = []
+    for line in msl.split('\n'):
+        if 'operator [] (size_t pos)' not in line:
+            line = re.sub(r'\bthreadgroup\b(?=\s)', 'device', line)
+            line = re.sub(r'(?<!mem_device \| )mem_flags::mem_threadgroup\b', 'mem_flags::mem_device | mem_flags::mem_threadgroup', line)
+        lines.append(line)
+    return '\n'.join(lines)
+
+
+def to_stage(msl, i, reads=None, _scratch=False):
     """The translated kernel as the object function main0 (kind 'ts'), or the mesh functions main0 and main0_z (kind 'ms': the two depth conventions, as dmsh_entry.py vs_depth gives a
     vertex shader, near = -w and near = 0). reads: {user(locnN) location: component mask} of what a mesh shader's paired pixel shaders read (pixel_reads), None when not known.
     A location its SPHs do not enable becomes a vertex output of (0,0,0,1), what the hardware gives a pixel shader input no stage wrote (dmsh_build.py vs_pad does the same for a
@@ -145,6 +156,12 @@ def to_stage(msl, i, reads=None):
     # stay in it: one call a thread, as the kernel ran
     src = (msl[:m.start()] + f'static inline __attribute__((always_inline)) void dm_stage_body({", ".join(plain + [f"threadgroup spvUnsafeArray<uint, {words}>& {mem}"])})\n{{\n' +
            (f'    {local}\n' if local else '') + msl[m.end():])
+    scratch = kind == 'ms' and not i.get('task', True) and i['threads'] == 32 and 6000 <= words * 4 <= 16384
+    if scratch:
+        i['scratch'] = (words * 4 + 255) & ~255
+    if _scratch:
+        if not scratch: raise ValueError('device mesh stage needs one SIMD-group and no task shader')
+        src = _device_stage(src)
     call = f'dm_stage_body({", ".join(names + [mem])});'
     # The thread's and the threadgroup's numbers: the kernel's parameters where it has them (an attribute may appear once in a function), else parameters of the wrapper's own
     own = {t[3]: t[2] + ('.x' if t[1] == 'uint3' else '') for t in map(_THREAD.match, params) if t}
@@ -156,6 +173,10 @@ def to_stage(msl, i, reads=None):
     start = (f'    threadgroup spvUnsafeArray<uint, {words}> {mem};\n'
              f'    for (uint i = {lid}; i < {words}u; i += {thr}u) {mem}[i] = 0u;\n'
              '    threadgroup_barrier(mem_flags::mem_threadgroup);\n')
+    if _scratch:
+        start = (f'    device spvUnsafeArray<uint, {words}>& {mem} = *(device spvUnsafeArray<uint, {words}>*)(dm_scr + ulong(dm_block.scratch + {tg}) * {i["scratch"]}ul);\n'
+                 f'    for (uint i = {lid}; i < {words}u; i += {thr}u) {mem}[i] = 0u;\n'
+                 '    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);\n')
     head = f'struct dm_payload_t {{ uint w[{max(pay, 1)}]; }};\n'
     sig = ', '.join(params + extra)
     draw = f'constant uint* dm_draw [[buffer({abi.MESH_DRAW_SLOT})]]'   # the draw's {count, first}, which the host binds (nvn_geometry.inc mtk_encode)
@@ -217,8 +238,18 @@ def to_stage(msl, i, reads=None):
                 f'    for (uint n = {lid}; n < np * {verts}u; n += {thr}u)\n    {{\n        uint at = {prim + 4}u + n;\n        dm_out.set_index(n, ({mem}[at >> 2] >> ((at & 3u) * 8u)) & 0xffu);\n    }}\n}}\n')
     if i['task']: return src + '\n' + head + entry('main0', True) + '\n' + entry('main0_z', False)
     # The object function of a mesh shader with no task: one thread a block of METAL_MAX_GRID workgroups
-    head += 'struct dm_block_t { uint first; };\n'
+    head += 'struct dm_block_t { uint first;' + (' uint scratch;' if _scratch else '') + ' };\n'
     obj = (f'[[object]] void main0_o(object_data dm_block_t& dm_block [[payload]], mesh_grid_properties dm_grid, uint dm_otg [[threadgroup_position_in_grid]], {draw})\n{{\n'
            f'    uint b = dm_otg * {METAL_MAX_GRID}u;\n    dm_block.first = dm_draw[1] + b;\n'
            f'    dm_grid.set_threadgroups_per_grid(uint3(min(dm_draw[0] - b, {METAL_MAX_GRID}u), 1u, 1u));\n}}\n')
-    return src + '\n' + head + entry('main0', True) + '\n' + entry('main0_z', False) + '\n' + obj
+    result = src + '\n' + head + entry('main0', True) + '\n' + entry('main0_z', False) + '\n' + obj
+    if _scratch:
+        result = result.replace('dm_block.first = dm_draw[1] + b;', 'dm_block.first = dm_draw[1] + b; dm_block.scratch = b;')
+        for old, new, attr in [('main0_z', 'main0_zs', 'mesh'), ('main0', 'main0_s', 'mesh'), ('main0_o', 'main0_os', 'object')]:
+            result = result.replace(f'[[{attr}]] void {old}(', f'[[{attr}, host_name("{new}")]] void {new}(')
+        result = result.replace('dm_mesh_t dm_out,', f'device uchar* dm_scr [[buffer({abi.MESH_SCRATCH_SLOT})]], dm_mesh_t dm_out,')
+        result = re.sub(r'^\s*#include[^\n]*\n', '', _device_stage(result), flags=re.M)   # imports must stay outside the alternate entry's namespace
+    elif scratch:
+        # Independent entry points: no threadgroup array is reserved by the device entry. A whole draw selects one entry, never a subset of its meshlets.
+        result += '\nnamespace dm_mesh_scratch {\n' + to_stage(msl, i, reads, _scratch=True) + '\n}\n'
+    return result

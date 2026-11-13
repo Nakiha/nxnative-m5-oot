@@ -177,11 +177,13 @@ def plan_compute(lib_dir, chain, shaders):
         except (OSError, ValueError): j = None
         if not isinstance(j, dict) or j.get('chain') != chain or j.get('stage', 'cs') != 'cs': left['reflection'] += 1; continue
         entry = j.get('entry') or 'main0'
-        try: fs = constants(lib_dir / f'{pc}.metallib')
-        except (OSError, ValueError): left['library'] += 1; continue
-        if entry not in fs: left['entry'] += 1; continue
-        if any(c not in HOST_CONSTANTS for c in fs[entry]): left['constants'] += 1; continue   # script specializes HOST_CONSTANTS, as cps_new looks the pipeline up
-        if (pc, entry) not in seen: seen.add((pc, entry)); pipes.append((pc, entry))
+        variants = [pc] + ([j['hmma_tensor']] if isinstance(j.get('hmma_tensor'), str) else [])
+        for variant in variants:
+            try: fs = constants(lib_dir / f'{variant}.metallib')
+            except (OSError, ValueError): left['library'] += 1; continue
+            if entry not in fs: left['entry'] += 1; continue
+            if any(c not in HOST_CONSTANTS for c in fs[entry]): left['constants'] += 1; continue
+            if (variant, entry) not in seen: seen.add((variant, entry)); pipes.append((variant, entry))
     return pipes, left
 
 

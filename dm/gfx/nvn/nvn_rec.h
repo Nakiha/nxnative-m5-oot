@@ -2,8 +2,8 @@
 // About 40% of the submit thread's time was spent inside Metal itself: encoder creation, draw calls, state setters and argument table writes (Breath of the Wild: about 2.7 of 6.5 ms a frame).
 // With this switch the replay talks to stand-ins for the main command buffer, its encoders and the argument tables it rewrites per draw. Each call becomes a fixed-size record (objects retained);
 // records go to the encode thread in blocks, and the encode thread makes the same calls in the same order on the real objects. Commits of the main command buffer and of upload batches, and
-// event signals, are records too, so the queue sees work in exactly the order it did before. The submit thread waits for the encode thread to finish (rec_drain) at the end of each submission
-// and before anything that waits for the GPU or uses another queue, so nothing outside the submission can tell the difference.
+// event signals, are records too, so the queue sees work in exactly the order it did before. By default the submit thread waits for the encode thread to finish (rec_drain) at each submission's
+// end. DM_NVN_ENC_ASYNC=1 publishes those records without waiting; hard drains before synchronous encoding results or another queue remain. GPU fences still cover the actual work.
 // Everything else the replay creates (textures, views, pipelines, buffers, residency) stays on the submit thread: device calls, safe from any thread. Queue commits take the residency lock,
 // since the submit thread may be adding to the set at the same time.
 // A selector the stand-ins do not implement stops the host with its name (forwardingTargetForSelector), so a missing one cannot silently drop work.
@@ -251,6 +251,13 @@ static void rec_drain(void) {
     while (g_rb_head || g_rb_busy) { blocked = 1; pthread_cond_wait(&g_rb_idle, &g_rb_mu); }
     pthread_mutex_unlock(&g_rb_mu);
     if (ws_on()) ws_put(WS_DRAIN, w0, blocked);
+}
+// A submission only hands over owned records: later submissions append to the same FIFO, and their allocator cannot be reset until its GPU fence passes.
+// Keep hard drains before another queue or a synchronous encoding result. This switch does not replay past an NVN event wait; the queue worker still selects only ready work.
+static void rec_sub_end(void) {
+    static int async = -1;
+    if (async < 0) { const char *e = getenv("DM_NVN_ENC_ASYNC"); async = e && atoi(e) > 0; if (async) MLOG("Submission records published without an encode-thread drain (DM_NVN_ENC_ASYNC=1)"); }
+    if (async) rec_publish(); else rec_drain();
 }
 // A block of records from another thread than the submit thread (the present snapshot's copy): it goes in one piece behind every block published so far. Everything the game
 // submitted before it presents is published by then (a submission publishes its records before it returns), so the block runs after the frame's work, and the presenting thread

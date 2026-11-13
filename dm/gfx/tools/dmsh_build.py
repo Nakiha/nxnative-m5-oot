@@ -198,7 +198,7 @@ def cache_outputs(key, digest, cached=False):
         required = [key + '_b.json'] + ([key + '_b.metal'] if label == 'mac' else [])
         if label in TARGETS: required.append(key + '_b.metallib')
         have = STORE.names(f'{root}/{label}/') if cached else set()
-        names = required + [key + s + ext for s in ('_bg0', '_bg1', '_bg2', '_bg3', '_bg4', '_bgv', '_bl0', '_bl1', '_bl3') for ext in ('.metallib', '.json', '.metal')
+        names = required + [key + s + ext for s in ('_bg0', '_bg1', '_bg2', '_bg3', '_bg4', '_bgv', '_bl0', '_bl1', '_bl3', '_bt') for ext in ('.metallib', '.json', '.metal')
                             if (label == 'mac' or ext != '.metal') and (ext != '.metallib' or label in TARGETS)]
         found = [n for n in names if (f'{root}/{label}/{n}' in have if cached else os.path.exists(os.path.join(directory, n)))]
         if not all(n in found for n in required): return None
@@ -250,7 +250,8 @@ def publish_cache(key, digest, rule_fp, code_fp):
 
 def write_refl(key, refl):
     for target, d in (('mac', out),) + ((('ios', IOSOUT),) if IOSOUT else ()):
-        atomic_json(os.path.join(d, key + '_b.json'), MTL.with_compiler(target, refl))
+        meta = refl if target == 'mac' else {k: v for k, v in refl.items() if k != 'hmma_tensor'}
+        atomic_json(os.path.join(d, key + '_b.json'), MTL.with_compiler(target, meta))
 
 VIN_STATS = collections.Counter()
 PULL_STATS = collections.Counter()
@@ -823,6 +824,16 @@ def finish(key, w, j, c1):
         try: compile_targets()
         except subprocess.CalledProcessError as e: return 'metal failed', str(e)[:160], None
     clone(msl, os.path.join(out, key + '_b.metal'))
+    tensor_variant = None
+    if 'mac' in TARGETS and j['stage'] == 'cs' and not spill:
+        tsrc = dmsh_rewrite.hmma_tensor_msl(open(msl).read())
+        if tsrc:
+            tmsl = os.path.join(w, key + '_bt.metal')
+            open(tmsl, 'w').write(tsrc)
+            try: MTL.compile('mac', tmsl, os.path.join(out, key + '_bt.metallib'))
+            except subprocess.CalledProcessError as e: return 'tensor Metal failed', str(e)[:160], None
+            clone(tmsl, os.path.join(out, key + '_bt.metal'))
+            tensor_variant = key + '_bt'
     entry = re.search(r'(vertex|fragment|kernel)\s+\S+\s+(\w+)\s*\(', src)
     dr = dmsh_reflect.drv_reads(src)
     refl = {'key': key + '_b', 'route': 'B', 'chain': CHAIN, 'dm_ctl': key, 'source': f'{name}#{k}', 'pc_paired': pc_of[key], 'stage': mesh['kind'] if mesh else j['stage'],
@@ -834,7 +845,8 @@ def finish(key, w, j, c1):
             **({'entry_tf': 'main0_tf', 'tf_strides': [e['stride'] if e else 0 for e in j['tf']]} if j.get('tf') else {}),
             **({'entry_layer': 'main0_l', 'entry_layer_z': 'main0_lz', 'layer_from': lay} if lay else {}), **({'entry_u': 'main0_u'} if fu else {}), **({'entry_m': 'main0_m', 'uint_mask_m': fmask} if fu and fmask else {}), **({'entry_d': 'main0_d'} if fd else {}), **({'blend_zero': True} if blend0 else {}), **({'entries_lost': lost} if lost else {}),
             **({'first_store': [{'reg': next(b['reg'] for b in binds if b['msl_name'] == n), 'word': w, 'value': v} for n, w, v in first]} if first else {}),
-            **({'tg_spill': spill} if spill else {}),
+            **({'tg_spill': spill} if spill else {}), **({'hmma_tensor': tensor_variant} if tensor_variant else {}),
+            **({'mesh_scratch': mesh['scratch'], 'entry_scratch': 'main0_s', 'entry_scratch_z': 'main0_zs', 'entry_scratch_object': 'main0_os'} if mesh and mesh.get('scratch') else {}),
             'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + (['not in the answer table, queries use defaults'] if j.get('no_facts') else []), 'drv_reads': dr, 'drv_unfillable': dmsh_reflect.unfillable(dr, mesh['kind'] if mesh else j['stage']),
             'bindings': binds,
             'vertex_inputs': [{'location': int(m.group(3)), 'msl_type': m.group(1)} for m in dmsh_reflect.attributes(src)],

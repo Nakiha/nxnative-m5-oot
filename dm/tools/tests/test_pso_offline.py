@@ -190,6 +190,12 @@ class Compute(unittest.TestCase):
         self.assertEqual(pipes, [('c1_b', 'main0'), ('c2_b', 'main0')])   # each once
         self.assertEqual(left, {'reflection': 3, 'library': 1, 'entry': 1, 'constants': 1})
 
+    def test_optional_tensor_pipeline_is_included(self):
+        self.shader('c1', {'stage': 'cs', 'hmma_tensor': 'c1_bt'}, {'_b': [('main0', False)], '_bt': [('main0', False)]})
+        pipes, left = po.plan_compute(self.d, CHAIN, ['c1_b'])
+        self.assertEqual(pipes, [('c1_b', 'main0'), ('c1_bt', 'main0')])
+        self.assertEqual(sum(left.values()), 0)
+
     def test_border_constant_kernel_is_specialized(self):   # the border corrections' constant alone: specialized as cps_new looks up the common dispatch's pipeline (cps_new_b)
         self.shader('kb', {'stage': 'cs'}, {'_b': [('main0', ('dm_border_off',))]})
         self.shader('kbs', {'stage': 'cs'}, {'_b': [('main0', ('dm_border_off', 'spvLinearTextureAlignmentOverride'))]})

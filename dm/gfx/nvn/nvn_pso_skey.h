@@ -11,7 +11,8 @@ typedef struct {
     uint32_t atest, logic;   // atest: 1 = drawn with the alpha test, the fragment from the shader's side library <key>_bx (nvn_mtl.m atest_key); last, so a prewarm row written before it reads as 0
                              // logic: 1 = drawn with a logic operation, the fragment from the side library <key>_bx (lop_key); in what was padding (0 in older rows)
     va_st attr_hi[16];       // NVN2's attributes 16 to 31 (pso_key_attr); last, so a prewarm row written before them reads as 0
-    uint32_t border, border_spare;   // border: 1 = a sampler the draw binds has a twin, so the shaders keep their border colour corrections (nvn_mtl.m border_need); 0 = specialized without
+    uint32_t border; union { uint32_t border_spare, mesh_scratch; };   // mesh_scratch: an optional draw-private mesh stage; reuses the reserved word, so old keys remain native
+                                   // border: 1 = a sampler the draw binds has a twin, so the shaders keep their border colour corrections (nvn_mtl.m border_need); 0 = specialized without
                                      // them (fn_off); last, so a prewarm row written before it reads as 0. border_spare keeps the key a whole number of 8-byte words
 } pso_key;
 static inline va_st pso_key_attr(const pso_key *k, int a) { return a < 16 ? k->attr[a] : k->attr_hi[a - 16]; }
